@@ -2,7 +2,7 @@
 
 A cozy Animal Crossing-style fan demo in a single self-contained HTML file. No build, no dependencies (just Google Fonts).
 
-**Play it:** https://fabiosanchez-aircury.github.io/animal-isle/
+**Play it:** https://fabiosanchez-aircury.github.io/animal-crossing-web/
 
 - Pseudo-3D "rolling world" renderer on Canvas 2D (no WebGL, no images — everything drawn procedurally)
 - Real-time day/night cycle and seasons synced to your local clock
