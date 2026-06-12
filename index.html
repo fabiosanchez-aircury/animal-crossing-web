@@ -1,0 +1,2668 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Animal Isle</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;800;900&display=swap" rel="stylesheet">
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#1a2238; }
+  #game { display:block; width:100vw; height:100vh; }
+  #nameInput {
+    position:fixed; left:50%; top:58%; transform:translate(-50%,-50%);
+    width:min(320px, 70vw); padding:14px 20px; font:800 22px 'Nunito', sans-serif;
+    text-align:center; color:#5b4326; background:#fffbe9; border:4px solid #b98d52;
+    border-radius:999px; outline:none; box-shadow:0 6px 0 rgba(0,0,0,.18);
+    display:none; z-index:10;
+  }
+  #nameInput::placeholder { color:#c9b48e; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<input id="nameInput" maxlength="12" placeholder="..." autocomplete="off" spellcheck="false">
+<script>
+'use strict';
+/* ==================================================================
+   ANIMAL ISLE v2 — fan demo
+   - pseudo-3D "rolling world" renderer (curved horizon, like AC)
+   - procedural island per save seed, 3 save slots
+   - progression: tools → house → shop → museum → café → neighbors
+   - bilingual (ES/EN), procedural audio, real-time clock & seasons
+   ================================================================== */
+
+// ---------------- canvas / view ----------------
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const nameInput = document.getElementById('nameInput');
+const view = { w: 0, h: 0, dpr: 1, zoom: 3 };
+
+function resize() {
+  view.dpr = Math.min(window.devicePixelRatio || 1, 2);
+  view.w = window.innerWidth;
+  view.h = window.innerHeight;
+  cv.width = Math.floor(view.w * view.dpr);
+  cv.height = Math.floor(view.h * view.dpr);
+  view.zoom = Math.max(2, Math.min(4, Math.round(Math.min(view.w, view.h) / 300)));
+  ctx.imageSmoothingEnabled = false;
+  makeVignette();
+}
+window.addEventListener('resize', resize);
+
+// ---------------- utils ----------------
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+const rnd = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const hash2 = (x, y) => { const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return s - Math.floor(s); };
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function roundRect(c, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+const gameTime = () => performance.now() / 1000;
+
+// ---------------- real time / season ----------------
+function nowHour() { const d = new Date(); return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600; }
+function dayPeriod(h = nowHour()) {
+  if (h >= 6 && h < 12) return 'morning';
+  if (h >= 12 && h < 18) return 'afternoon';
+  if (h >= 18 && h < 21) return 'evening';
+  return 'night';
+}
+function season() {
+  const m = new Date().getMonth() + 1;
+  if (m >= 3 && m <= 5) return 'spring';
+  if (m >= 6 && m <= 8) return 'summer';
+  if (m >= 9 && m <= 11) return 'autumn';
+  return 'winter';
+}
+const SEASON = season();
+
+const SKY_KEYS = [
+  [0, ['#0b1030', '#1c2b52']], [5, ['#0b1030', '#1c2b52']],
+  [6.5, ['#e6986f', '#f7d9a0']], [9, ['#69b7e8', '#bfe6f7']],
+  [15, ['#5fb0e6', '#bce4f6']], [18.5, ['#f08a4f', '#fcd28a']],
+  [20, ['#5a4a8c', '#9b6e9e']], [21.5, ['#0b1030', '#1c2b52']],
+  [24, ['#0b1030', '#1c2b52']],
+];
+function hexToRgb(h) { return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]; }
+function mixHex(a, b, t) {
+  const A = hexToRgb(a), B = hexToRgb(b);
+  return `rgb(${Math.round(lerp(A[0], B[0], t))},${Math.round(lerp(A[1], B[1], t))},${Math.round(lerp(A[2], B[2], t))})`;
+}
+function skyColors(h = nowHour()) {
+  for (let i = 0; i < SKY_KEYS.length - 1; i++) {
+    const [h0, c0] = SKY_KEYS[i], [h1, c1] = SKY_KEYS[i + 1];
+    if (h >= h0 && h <= h1) {
+      const t = h1 === h0 ? 0 : (h - h0) / (h1 - h0);
+      return [mixHex(c0[0], c1[0], t), mixHex(c0[1], c1[1], t)];
+    }
+  }
+  return ['#69b7e8', '#bfe6f7'];
+}
+const LIGHT_KEYS = [
+  [0, [18, 28, 70, 0.46]], [5, [18, 28, 70, 0.46]],
+  [6.5, [255, 160, 90, 0.16]], [8.5, [0, 0, 0, 0]],
+  [16.5, [0, 0, 0, 0]], [18.5, [255, 120, 60, 0.20]],
+  [20, [95, 60, 130, 0.30]], [21.5, [18, 28, 70, 0.46]],
+  [24, [18, 28, 70, 0.46]],
+];
+function lightTint(h = nowHour()) {
+  for (let i = 0; i < LIGHT_KEYS.length - 1; i++) {
+    const [h0, c0] = LIGHT_KEYS[i], [h1, c1] = LIGHT_KEYS[i + 1];
+    if (h >= h0 && h <= h1) {
+      const t = h1 === h0 ? 0 : (h - h0) / (h1 - h0);
+      return [lerp(c0[0], c1[0], t), lerp(c0[1], c1[1], t), lerp(c0[2], c1[2], t), lerp(c0[3], c1[3], t)];
+    }
+  }
+  return [0, 0, 0, 0];
+}
+
+// ---------------- i18n ----------------
+let lang = 'en';
+try {
+  const st = JSON.parse(localStorage.getItem('ai-settings') || '{}');
+  lang = st.lang || ((navigator.language || 'en').toLowerCase().startsWith('es') ? 'es' : 'en');
+} catch (e) { lang = 'en'; }
+function setLang(l) {
+  lang = l;
+  try { localStorage.setItem('ai-settings', JSON.stringify({ lang })); } catch (e) {}
+}
+function T(key, vars) {
+  let s = (L10N[lang] && L10N[lang][key]) ?? L10N.en[key] ?? key;
+  if (vars) for (const k in vars) s = s.split('{' + k + '}').join(String(vars[k]));
+  return s;
+}
+const L10N = {
+  en: {
+    title_sub: 'a cozy little fan demo',
+    press_start: 'Press Enter',
+    lang_hint: 'L — Español',
+    clock_note: "It's {t} — the island lives on your clock",
+    slots_title: 'Choose a life',
+    slot_empty: '— New island —',
+    slot_day: 'Day {n}',
+    slots_help: '↑↓ choose · Enter play · X delete · L language · Esc back',
+    slot_del: 'press X again to delete!',
+    ask_name: 'And what should I call you, hm?',
+    intro_lines: [
+      "Yes, yes! Welcome, welcome! A brand-new island, made just for you, hm?",
+      "I'm Tom Nook. For now my office is... well, a tent. But oh, the PLANS we have!",
+      '@INPUT',
+      "{name}! A fine name, yes, yes!",
+      "Here's the deal: gather shells and fruit, sell them to me at the tent, and save those Bells!",
+      "With enough Bells we'll build you a house, a proper shop, a museum, even a café... and new neighbors will move in!",
+      "Buy a rod to fish and a shovel to dig fossils. Press E to talk and use things, I for your pockets, Tab for the map.",
+      "Well then! Your island life begins... now! Yes, yes!",
+    ],
+    nook_chat: [
+      "Every Bell saved is a Bell earned, hm!",
+      "The museum could use your fossils, yes, yes.",
+      "A café! Imagine the smell of coffee at sunrise...",
+      "Between us: the island looks better every day, hm?",
+    ],
+    i_shell: 'Shell', i_fruit: 'Peach', i_fish: 'Fish', i_fossil: 'Fossil',
+    i_flower: 'Flower', i_seeds: 'Flower Seeds', i_rod: 'Fishing Rod', i_shovel: 'Shovel', i_coffee: 'Coffee',
+    b_tent: "Nook's Tent", b_house: 'Your House', b_shop: "Nook's Cranny",
+    b_museum: 'Museum', b_cafe: 'The Perch Café', b_home1: "Paco's House", b_home2: "Luna's House",
+    menu_sell: 'Sell items', menu_buy: 'Buy', menu_build: 'Build projects', menu_chat: 'Chat', menu_leave: 'Leave',
+    sell_note_tent: 'tent prices (80%) — build the shop for full price!',
+    sell_note_shop: 'full prices, yes yes!',
+    tab_sell: 'SELL', tab_buy: 'BUY',
+    shop_empty: 'Nothing to sell — go explore!',
+    help_menu: '↑↓ select · Enter OK · Esc back',
+    help_shop: '↑↓ · Enter trade · A sell all · ←→ tab · Esc close',
+    sold: '+{b} Bells — sold {n}× {i}',
+    bought: 'Bought: {i}!',
+    own: 'You already own that, hm!',
+    no_bells: 'Not enough Bells, hm?',
+    built_cost: '{c} Bells',
+    built_tag: 'BUILT',
+    locked_prev: 'First we should build: {b}!',
+    already_built: 'Already built, yes, yes!',
+    built_done: '{b} built! It went up {d} of here!',
+    north: 'north', south: 'south', east: 'east', west: 'west',
+    new_neighbor: '{n} just moved to the island!',
+    need_rod: 'You need a fishing rod! Nook sells one.',
+    need_shovel: 'You need a shovel to dig! Ask Nook.',
+    caught: 'You caught a fish!',
+    dug: 'You dug up a fossil!',
+    got: '+1 {i}',
+    planted: 'Planted! It grows in a few real minutes.',
+    need_grass: 'Seeds need open grass!',
+    crowded: 'Too crowded to plant here.',
+    no_seeds: 'No seeds! Buy some first.',
+    harvest: '+1 Flower (grown with love)',
+    museum_title: 'Museum — donate one of each',
+    museum_help: '↑↓ select · Enter donate · Esc leave',
+    donate_done: 'Donated! +{b} Bells research grant',
+    donate_has: 'Already donated — thank you!',
+    donate_none: "You don't have one yet!",
+    museum_complete: 'Collection complete! +{b} Bells! ★',
+    museum_progress: '{n}/5 donated',
+    cafe_offer: 'Hot coffee — {c} Bells (run faster for 3 min)',
+    cafe_help: 'Enter buy · Esc leave',
+    coffee_on: 'Mmm! You feel quick! ☕',
+    rested: 'You rest at home... game saved.',
+    gift: 'Daily gift from Nook: +{b} Bells!',
+    pockets: "{n}'s Pockets",
+    tools_label: 'Tools:',
+    inv_help: 'I / Esc — close',
+    pause_continue: 'Keep playing',
+    pause_lang: 'Language: English (switch)',
+    pause_exit: 'Save & exit to menu',
+    pause_title: 'Paused',
+    controls: 'WASD move · Shift run · E use · I pockets · P plant · Tab map · M sound · Esc menu',
+    welcome_back: 'Welcome back, {n}!',
+    welcome: 'Welcome to your island!',
+    sound_on: 'Sound on', sound_off: 'Sound off',
+    obj_rod: 'Goal: buy a Fishing Rod at the tent ({c} Bells)',
+    obj_house: 'Goal: fund Your House ({c} Bells)',
+    obj_shovel: 'Goal: buy a Shovel at the tent ({c} Bells)',
+    obj_shop: "Goal: build Nook's Cranny ({c} Bells)",
+    obj_museum: 'Goal: build the Museum ({c} Bells)',
+    obj_cafe: 'Goal: build the Café ({c} Bells)',
+    obj_home1: 'Goal: build a neighbor house ({c} Bells)',
+    obj_home2: 'Goal: invite one more neighbor ({c} Bells)',
+    obj_donate: 'Goal: complete the museum collection',
+    obj_done: '★ Island complete! Live your best life ✿',
+    price: '{p} Bells',
+  },
+  es: {
+    title_sub: 'una pequeña demo fan',
+    press_start: 'Pulsa Enter',
+    lang_hint: 'L — English',
+    clock_note: 'Son las {t} — la isla vive en tu reloj',
+    slots_title: 'Elige una vida',
+    slot_empty: '— Isla nueva —',
+    slot_day: 'Día {n}',
+    slots_help: '↑↓ elegir · Enter jugar · X borrar · L idioma · Esc volver',
+    slot_del: '¡pulsa X otra vez para borrar!',
+    ask_name: 'Y dime... ¿cómo debería llamarte?',
+    intro_lines: [
+      "¡Sí, sí! ¡Bienvenido, bienvenido! Una isla nueva de fábrica, hecha solo para ti, ¿eh?",
+      "Soy Tom Nook. De momento mi oficina es... bueno, una tienda de campaña. ¡Pero menudos PLANES tenemos!",
+      '@INPUT',
+      "¡{name}! Un nombre estupendo, sí, sí.",
+      "El trato es este: recoge conchas y fruta, véndemelas en la tienda de campaña, ¡y ahorra esas bayas!",
+      "Con suficientes bayas construiremos tu casa, una tienda de verdad, un museo, hasta una cafetería... ¡y vendrán nuevos vecinos!",
+      "Compra una caña para pescar y una pala para desenterrar fósiles. Pulsa E para hablar y usar cosas, I para los bolsillos, Tab para el mapa.",
+      "¡Pues nada! Tu vida isleña empieza... ¡YA! ¡Sí, sí!",
+    ],
+    nook_chat: [
+      "Baya ahorrada, baya ganada, ¿eh?",
+      "Al museo le vendrían bien tus fósiles, sí, sí.",
+      "¡Una cafetería! Imagina el olor a café al amanecer...",
+      "Entre tú y yo: la isla está cada día más bonita, ¿eh?",
+    ],
+    i_shell: 'Concha', i_fruit: 'Melocotón', i_fish: 'Pez', i_fossil: 'Fósil',
+    i_flower: 'Flor', i_seeds: 'Semillas de flor', i_rod: 'Caña de pescar', i_shovel: 'Pala', i_coffee: 'Café',
+    b_tent: 'Tienda de Nook', b_house: 'Tu casa', b_shop: 'Mini Nook',
+    b_museum: 'Museo', b_cafe: 'Café La Percha', b_home1: 'Casa de Paco', b_home2: 'Casa de Luna',
+    menu_sell: 'Vender objetos', menu_buy: 'Comprar', menu_build: 'Proyectos de obra', menu_chat: 'Charlar', menu_leave: 'Salir',
+    sell_note_tent: 'precios de campaña (80%) — ¡construye la tienda para el precio completo!',
+    sell_note_shop: '¡precios completos, sí, sí!',
+    tab_sell: 'VENDER', tab_buy: 'COMPRAR',
+    shop_empty: 'Nada que vender... ¡sal a explorar!',
+    help_menu: '↑↓ elegir · Enter OK · Esc volver',
+    help_shop: '↑↓ · Enter comerciar · A vender todo · ←→ pestaña · Esc cerrar',
+    sold: '+{b} bayas — vendido {n}× {i}',
+    bought: '¡Comprado: {i}!',
+    own: '¡Ya tienes uno de esos!',
+    no_bells: 'No te llegan las bayas, ¿eh?',
+    built_cost: '{c} bayas',
+    built_tag: 'HECHO',
+    locked_prev: '¡Primero hay que construir: {b}!',
+    already_built: '¡Eso ya está construido, sí, sí!',
+    built_done: '¡{b} en pie! ¡Está al {d} de aquí!',
+    north: 'norte', south: 'sur', east: 'este', west: 'oeste',
+    new_neighbor: '¡{n} se acaba de mudar a la isla!',
+    need_rod: '¡Necesitas una caña! Nook vende una.',
+    need_shovel: '¡Necesitas una pala para cavar! Pídesela a Nook.',
+    caught: '¡Has pescado un pez!',
+    dug: '¡Has desenterrado un fósil!',
+    got: '+1 {i}',
+    planted: '¡Plantado! Crece en unos minutos reales.',
+    need_grass: '¡Las semillas necesitan hierba despejada!',
+    crowded: 'Demasiado lleno para plantar aquí.',
+    no_seeds: '¡No tienes semillas! Compra primero.',
+    harvest: '+1 Flor (cultivada con cariño)',
+    museum_title: 'Museo — dona uno de cada',
+    museum_help: '↑↓ elegir · Enter donar · Esc salir',
+    donate_done: '¡Donado! +{b} bayas de beca de investigación',
+    donate_has: 'Ya está donado, ¡gracias!',
+    donate_none: '¡Aún no tienes ninguno!',
+    museum_complete: '¡Colección completa! ¡+{b} bayas! ★',
+    museum_progress: '{n}/5 donados',
+    cafe_offer: 'Café calentito — {c} bayas (corres más durante 3 min)',
+    cafe_help: 'Enter comprar · Esc salir',
+    coffee_on: '¡Mmm! ¡Qué energía! ☕',
+    rested: 'Descansas en casa... partida guardada.',
+    gift: 'Regalo diario de Nook: ¡+{b} bayas!',
+    pockets: 'Bolsillos de {n}',
+    tools_label: 'Herramientas:',
+    inv_help: 'I / Esc — cerrar',
+    pause_continue: 'Seguir jugando',
+    pause_lang: 'Idioma: Español (cambiar)',
+    pause_exit: 'Guardar y salir al menú',
+    pause_title: 'Pausa',
+    controls: 'WASD mover · Shift correr · E usar · I bolsillos · P plantar · Tab mapa · M sonido · Esc menú',
+    welcome_back: '¡Bienvenido de nuevo, {n}!',
+    welcome: '¡Bienvenido a tu isla!',
+    sound_on: 'Sonido activado', sound_off: 'Sonido silenciado',
+    obj_rod: 'Meta: compra una Caña en la tienda de campaña ({c} bayas)',
+    obj_house: 'Meta: financia Tu Casa ({c} bayas)',
+    obj_shovel: 'Meta: compra una Pala en la tienda de campaña ({c} bayas)',
+    obj_shop: 'Meta: construye Mini Nook ({c} bayas)',
+    obj_museum: 'Meta: construye el Museo ({c} bayas)',
+    obj_cafe: 'Meta: construye la cafetería ({c} bayas)',
+    obj_home1: 'Meta: construye una casa de vecino ({c} bayas)',
+    obj_home2: 'Meta: invita a un vecino más ({c} bayas)',
+    obj_donate: 'Meta: completa la colección del museo',
+    obj_done: '★ ¡Isla completa! Vive tu mejor vida ✿',
+    price: '{p} bayas',
+  },
+};
+
+// ---------------- items / economy / progression ----------------
+const ITEMS = {
+  shell: { sell: 60 }, fruit: { sell: 100 }, fish: { sell: 300 },
+  fossil: { sell: 600 }, flower: { sell: 240 }, seeds: { sell: 30, buy: 120 },
+  rod: { buy: 500 }, shovel: { buy: 800 }, coffee: { buy: 150 },
+};
+const INV_ORDER = ['shell', 'fruit', 'fish', 'fossil', 'flower', 'seeds'];
+const DONATABLE = ['shell', 'fruit', 'fish', 'fossil', 'flower'];
+const PROJECTS = [
+  { key: 'house', cost: 800 }, { key: 'shop', cost: 1500 }, { key: 'museum', cost: 2500 },
+  { key: 'cafe', cost: 3500 }, { key: 'home1', cost: 1500 }, { key: 'home2', cost: 1500 },
+];
+const BD = { // building dimensions (w, h above base)
+  tent: { w: 46, h: 38 }, house: { w: 70, h: 54 }, shop: { w: 76, h: 58 },
+  museum: { w: 110, h: 62 }, cafe: { w: 80, h: 56 }, home1: { w: 56, h: 46 }, home2: { w: 56, h: 46 },
+};
+const DONATE_GRANT = 300, COMPLETE_BONUS = 2000, GIFT_BELLS = 500, COFFEE_DUR = 180;
+
+// ---------------- save slots ----------------
+const SLOT_KEY = i => 'ai-slot-' + i;
+let currentSlot = -1;
+let prog = null; // { seed, createdAt, built:{}, tools:{}, donated:{}, lastGift, star }
+function freshProg(seed) {
+  return { seed, createdAt: Date.now(), built: {}, tools: {}, donated: {}, lastGift: '', star: false };
+}
+function readSlot(i) {
+  try { return JSON.parse(localStorage.getItem(SLOT_KEY(i))); } catch (e) { return null; }
+}
+function persist() {
+  if (currentSlot < 0 || !prog) return;
+  try {
+    localStorage.setItem(SLOT_KEY(currentSlot), JSON.stringify({
+      name: player.name, bells: player.bells, inv: player.inv,
+      seed: prog.seed, createdAt: prog.createdAt, built: prog.built, tools: prog.tools,
+      donated: prog.donated, lastGift: prog.lastGift, star: prog.star,
+      plants: plants.map(p => ({ x: p.x, y: p.y, t0: p.t0 })),
+    }));
+  } catch (e) {}
+}
+// migrate v1 save into slot 0
+(function migrate() {
+  try {
+    const old = JSON.parse(localStorage.getItem('animal-isle-save'));
+    if (old && old.name && !readSlot(0)) {
+      const p = freshProg(Math.floor(Math.random() * 1e9));
+      localStorage.setItem(SLOT_KEY(0), JSON.stringify({
+        name: old.name, bells: old.bells || 100, inv: old.inv || {},
+        ...p, plants: [],
+      }));
+    }
+    localStorage.removeItem('animal-isle-save');
+  } catch (e) {}
+})();
+window.addEventListener('beforeunload', () => { if (state === 'play') persist(); });
+
+// ---------------- world (procedural per seed) ----------------
+const TILE = 16, MW = 110, MH = 88;
+const WORLD_W = MW * TILE, WORLD_H = MH * TILE;
+const T_WATER = 0, T_SAND = 1, T_GRASS = 2;
+let map = [], trees = [], rocks = [], wildflowers = [], foamEdges = [];
+let plots = {}; // key -> {x, y} (base/door center, world px)
+let terrainCv = null;
+let spawnPt = { x: 0, y: 0 };
+
+const tileAt = (px, py) => {
+  const tx = Math.floor(px / TILE), ty = Math.floor(py / TILE);
+  if (tx < 0 || ty < 0 || tx >= MW || ty >= MH) return T_WATER;
+  return map[ty][tx];
+};
+const isLand = (px, py) => tileAt(px, py) !== T_WATER;
+
+function genWorld(seed) {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    if (tryGenWorld(seed + attempt * 7919)) return;
+  }
+  tryGenWorld(1337); // bulletproof fallback
+}
+function tryGenWorld(seed) {
+  const rng = mulberry32(seed);
+  const cx = MW / 2, cy = MH / 2;
+  const p1 = rng() * TAU, p2 = rng() * TAU, p3 = rng() * TAU;
+  const f1 = 0.20 + rng() * 0.16, f2 = 0.18 + rng() * 0.14, f3 = 0.12 + rng() * 0.10;
+  const a1 = 0.06 + rng() * 0.06, a2 = 0.05 + rng() * 0.05, a3 = 0.04 + rng() * 0.04;
+  const rx = MW * (0.38 + rng() * 0.06), ry = MH * (0.36 + rng() * 0.06);
+  map = [];
+  let grassCount = 0;
+  for (let y = 0; y < MH; y++) {
+    map[y] = [];
+    for (let x = 0; x < MW; x++) {
+      const nx = (x - cx) / rx, ny = (y - cy) / ry;
+      let d = Math.sqrt(nx * nx + ny * ny);
+      d += a1 * Math.sin(x * f1 + p1) + a2 * Math.cos(y * f2 + p2) + a3 * Math.sin((x + y) * f3 + p3);
+      let t = d < 0.72 ? T_GRASS : d < 0.93 ? T_SAND : T_WATER;
+      if (x < 2 || y < 2 || x >= MW - 2 || y >= MH - 2) t = T_WATER;
+      map[y][x] = t;
+      if (t === T_GRASS) grassCount++;
+    }
+  }
+  if (grassCount < 2000) return false;
+  // ponds
+  const nPonds = 1 + (rng() < 0.6 ? 1 : 0);
+  for (let p = 0; p < nPonds; p++) {
+    for (let tr = 0; tr < 100; tr++) {
+      const px = Math.floor(cx + (rng() * 2 - 1) * rx * 0.55);
+      const py = Math.floor(cy + (rng() * 2 - 1) * ry * 0.55);
+      if (map[py] && map[py][px] === T_GRASS) {
+        const r = 2.2 + rng() * 1.4;
+        for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) {
+          const d = Math.hypot(x - px, y - py);
+          if (d < r && map[y][x] === T_GRASS) map[y][x] = T_WATER;
+          else if (d < r + 1.1 && map[y][x] === T_GRASS) map[y][x] = T_SAND;
+        }
+        break;
+      }
+    }
+  }
+  // building plots
+  const placed = [];
+  const clearGrass = (tx, ty, hw, hh) => {
+    for (let y = ty - hh; y <= ty + 1; y++) for (let x = tx - hw; x <= tx + hw; x++) {
+      if (x < 0 || y < 0 || x >= MW || y >= MH || map[y][x] !== T_GRASS) return false;
+    }
+    return true;
+  };
+  const findSpot = (fx, fy, maxR, hw, hh) => {
+    for (let t = 0; t < 700; t++) {
+      const a = rng() * TAU, r = 3 + rng() * maxR;
+      const tx = Math.floor(fx + Math.cos(a) * r), ty = Math.floor(fy + Math.sin(a) * r * 0.8);
+      if (!clearGrass(tx, ty, hw, hh)) continue;
+      if (!placed.every(p => Math.hypot(p[0] - tx, p[1] - ty) > 8)) continue;
+      placed.push([tx, ty]);
+      return { x: tx * TILE + 8, y: ty * TILE + 8 };
+    }
+    return null;
+  };
+  plots = {};
+  plots.tent = findSpot(cx, cy, 7, 3, 3);
+  if (!plots.tent) return false;
+  const tcx = plots.tent.x / TILE, tcy = plots.tent.y / TILE;
+  plots.house = findSpot(tcx, tcy, 13, 3, 4);
+  plots.shop = findSpot(tcx, tcy, 16, 3, 4);
+  plots.museum = findSpot(cx, cy, 20, 4, 5);
+  plots.cafe = findSpot(cx, cy, 20, 3, 4);
+  plots.home1 = findSpot(cx, cy, 24, 3, 3);
+  plots.home2 = findSpot(cx, cy, 24, 3, 3);
+  for (const k in plots) if (!plots[k]) return false;
+  spawnPt = { x: plots.tent.x, y: plots.tent.y + 36 };
+  if (tileAt(spawnPt.x, spawnPt.y) !== T_GRASS) {
+    outer: for (let r = 1; r < 12; r++) for (let a = 0; a < TAU; a += 0.5) {
+      const sx = plots.tent.x + Math.cos(a) * r * TILE, sy = plots.tent.y + 20 + Math.sin(a) * r * TILE;
+      if (tileAt(sx, sy) === T_GRASS) { spawnPt = { x: sx, y: sy }; break outer; }
+    }
+  }
+  // trees / rocks / flowers
+  trees = []; rocks = []; wildflowers = [];
+  const farFromPlots = (x, y, d) => Object.values(plots).every(p => dist(x, y, p.x, p.y) > d);
+  let tries = 0;
+  while (trees.length < 48 && tries++ < 6000) {
+    const x = rng() * WORLD_W, y = rng() * WORLD_H;
+    if (tileAt(x, y) !== T_GRASS) continue;
+    if (!farFromPlots(x, y, 64)) continue;
+    if (dist(x, y, spawnPt.x, spawnPt.y) < 50) continue;
+    if (!trees.every(t => dist(x, y, t.x, t.y) > 42)) continue;
+    trees.push({ x, y, sway: rng() * TAU });
+  }
+  tries = 0;
+  while (rocks.length < 10 && tries++ < 3000) {
+    const x = rng() * WORLD_W, y = rng() * WORLD_H;
+    if (tileAt(x, y) !== T_GRASS) continue;
+    if (!farFromPlots(x, y, 60) || !trees.every(t => dist(x, y, t.x, t.y) > 26)) continue;
+    if (!rocks.every(r => dist(x, y, r.x, r.y) > 70)) continue;
+    rocks.push({ x, y, s: 0.8 + rng() * 0.6 });
+  }
+  for (let c = 0; c < 14; c++) {
+    let fx, fy, ok = false, t2 = 0;
+    while (!ok && t2++ < 250) {
+      fx = rng() * WORLD_W; fy = rng() * WORLD_H;
+      ok = tileAt(fx, fy) === T_GRASS && farFromPlots(fx, fy, 56);
+    }
+    if (!ok) continue;
+    const n = 5 + Math.floor(rng() * 5);
+    const hue = pick([['#ff6f87', '#ffd2da'], ['#ffd14f', '#fff0b8'], ['#ff9a4d', '#ffe0c2'], ['#c98bff', '#ecd9ff'], ['#ff5c5c', '#ffc9c9']]);
+    for (let i = 0; i < n; i++) {
+      const x = fx + (rng() - 0.5) * 60, y = fy + (rng() - 0.5) * 44;
+      if (tileAt(x, y) === T_GRASS) wildflowers.push({ x, y, c1: hue[0], c2: hue[1], ph: rng() * TAU });
+    }
+  }
+  // foam edges
+  foamEdges = [];
+  const dirs = [[0, -1], [1, 0], [0, 1], [-1, 0]];
+  for (let y = 1; y < MH - 1; y++) for (let x = 1; x < MW - 1; x++) {
+    if (map[y][x] === T_WATER) continue;
+    dirs.forEach(([dx, dy], side) => {
+      if (map[y + dy][x + dx] === T_WATER) foamEdges.push({ x, y, side, ph: hash2(x, y) * TAU });
+    });
+  }
+  renderTerrain(seed);
+  return true;
+}
+
+function renderTerrain(seed) {
+  terrainCv = document.createElement('canvas');
+  terrainCv.width = WORLD_W; terrainCv.height = WORLD_H;
+  const g = terrainCv.getContext('2d');
+  const pal = {
+    spring: { grass: ['#62b84e', '#5bb046'], sand: ['#ecd9a2', '#e5d199'] },
+    summer: { grass: ['#54ad47', '#4da540'], sand: ['#ecd9a2', '#e5d199'] },
+    autumn: { grass: ['#a3a953', '#99a04c'], sand: ['#e6d3a0', '#dfcb96'] },
+    winter: { grass: ['#e9eef3', '#e1e8ef'], sand: ['#ded7c4', '#d6cfba'] },
+  }[SEASON];
+  const r2 = mulberry32(seed ^ 0x5f3759df);
+  for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) {
+    const t = map[y][x];
+    if (t === T_WATER) continue;
+    const set = t === T_GRASS ? pal.grass : pal.sand;
+    g.fillStyle = set[(x + y) % 2];
+    g.fillRect(x * TILE, y * TILE, TILE, TILE);
+    for (let i = 0; i < 2; i++) {
+      const sx = x * TILE + r2() * TILE, sy = y * TILE + r2() * TILE;
+      if (t === T_GRASS) {
+        g.fillStyle = SEASON === 'winter' ? 'rgba(255,255,255,.7)' : 'rgba(0,70,0,.13)';
+        g.fillRect(sx, sy, 2, r2() < 0.5 ? 3 : 2);
+      } else {
+        g.fillStyle = 'rgba(120,90,40,.16)';
+        g.fillRect(sx, sy, 2, 2);
+      }
+    }
+    if (t === T_SAND && y > 0 && map[y - 1][x] === T_GRASS) {
+      g.fillStyle = 'rgba(80,140,60,.35)';
+      g.fillRect(x * TILE, y * TILE, TILE, 3);
+    }
+  }
+}
+
+// buildings present in the world right now
+function activeBuildings() {
+  const out = [{ key: 'tent', ...plots.tent }];
+  for (const p of PROJECTS) if (prog && prog.built[p.key]) out.push({ key: p.key, ...plots[p.key] });
+  return out;
+}
+function buildingRects() {
+  return activeBuildings().map(b => {
+    const d = BD[b.key];
+    return { x0: b.x - d.w / 2 - 4, x1: b.x + d.w / 2 + 4, y0: b.y - d.h + 8, y1: b.y + 6, key: b.key };
+  });
+}
+let bRects = [];
+function refreshRects() { bRects = buildingRects(); }
+
+// ---------------- ground items / plants ----------------
+const groundItems = [];
+let plants = [];
+const SPAWN_TARGET = { shell: 12, fruit: 9, fossil: 5, fish: 6 };
+let spawnTimer = 0;
+
+function insideBuilding(x, y) {
+  return bRects.some(r => x > r.x0 && x < r.x1 && y > r.y0 && y < r.y1);
+}
+function randTileOfType(type, cond) {
+  for (let i = 0; i < 300; i++) {
+    const tx = Math.floor(rnd(MW)), ty = Math.floor(rnd(MH));
+    if (map[ty][tx] !== type) continue;
+    const x = tx * TILE + 8, y = ty * TILE + 8;
+    if (insideBuilding(x, y)) continue;
+    if (cond && !cond(x, y, tx, ty)) continue;
+    return { x, y };
+  }
+  return null;
+}
+const nearLand = (tx, ty) => {
+  for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+    const X = tx + dx, Y = ty + dy;
+    if (X >= 0 && Y >= 0 && X < MW && Y < MH && map[Y][X] !== T_WATER) return true;
+  }
+  return false;
+};
+function spawnItem(type) {
+  let p = null;
+  if (type === 'shell') p = randTileOfType(T_SAND);
+  else if (type === 'fossil') p = randTileOfType(T_GRASS, (x, y) => trees.every(t => dist(x, y, t.x, t.y) > 20));
+  else if (type === 'fish') p = randTileOfType(T_WATER, (x, y, tx, ty) => nearLand(tx, ty));
+  else if (type === 'fruit') {
+    const t = pick(trees);
+    if (t) p = { x: t.x + rnd(-18, 18), y: t.y + rnd(6, 18) };
+    if (p && (tileAt(p.x, p.y) !== T_GRASS || insideBuilding(p.x, p.y))) p = null;
+  }
+  if (p && groundItems.every(it => dist(it.x, it.y, p.x, p.y) > 20)) {
+    groundItems.push({ type, x: p.x, y: p.y, ph: rnd(TAU) });
+  }
+}
+function fillSpawns(initial) {
+  for (const type in SPAWN_TARGET) {
+    const want = SPAWN_TARGET[type];
+    const have = groundItems.filter(i => i.type === type).length;
+    const n = initial ? want - have : (have < want && Math.random() < 0.5 ? 1 : 0);
+    for (let i = 0; i < n; i++) spawnItem(type);
+  }
+}
+const GROW = [0, 60e3, 150e3, 240e3];
+function plantStage(p) {
+  const e = Date.now() - p.t0;
+  if (e < GROW[1]) return 0;
+  if (e < GROW[2]) return 1;
+  if (e < GROW[3]) return 2;
+  return 3;
+}
+
+// ---------------- player & NPCs ----------------
+const player = {
+  name: '', bells: 100, inv: {},
+  x: 0, y: 0, facing: 'down', step: 0, moving: false,
+  coffeeUntil: 0,
+};
+function addItem(type, n = 1) { player.inv[type] = (player.inv[type] || 0) + n; }
+
+const NPC_DEFS = [
+  {
+    id: 'mochi', name: 'Mochi', kind: 'cat', homeKey: null,
+    body: '#cfd6e6', accent: '#8d98b5', shirt: '#f2a7c3',
+    lines: {
+      en: {
+        morning: [["*yawwwn*... oh, morning, {name}.", "I was up all night watching moths. Riveting stuff, meow."],
+                  ["The morning birds are SO loud.", "I respect their dedication though, meow."]],
+        afternoon: [["This is prime napping sun right here.", "You're standing in my sunbeam, {name}... just so you know, meow."],
+                    ["I heard the beach shells just... come back.", "Don't think about it too hard, meow."]],
+        evening: [["The sunset makes the ocean look like peach jam.", "...Now I'm hungry, meow."],
+                  ["Evenings are for slow walks and big thoughts.", "Mostly about snacks, meow."]],
+        night: [["Shh... hear the crickets? My favorite song.", "Don't tell the radio, meow."],
+                ["You're up late, {name}!", "Night fishing is the best fishing. Trust me, meow."]],
+      },
+      es: {
+        morning: [["*booostezo*... ah, buenos días, {name}.", "Me pasé la noche mirando polillas. Apasionante, miau."],
+                  ["Los pájaros de la mañana son RUIDOSÍSIMOS.", "Aunque respeto su dedicación, miau."]],
+        afternoon: [["Este sol es perfecto para la siesta.", "Estás pisando mi rayito de sol, {name}... por si no lo sabías, miau."],
+                    ["Dicen que las conchas de la playa... reaparecen solas.", "No le des muchas vueltas, miau."]],
+        evening: [["El atardecer deja el mar color mermelada de melocotón.", "...Ahora tengo hambre, miau."],
+                  ["Las tardes son para paseos lentos y grandes ideas.", "Sobre todo ideas de meriendas, miau."]],
+        night: [["Shh... ¿oyes los grillos? Mi canción favorita.", "No se lo digas a la radio, miau."],
+                ["¡Qué trasnochador, {name}!", "La pesca nocturna es la mejor pesca. Hazme caso, miau."]],
+      },
+    },
+  },
+  {
+    id: 'hopkins', name: 'Hopkins', kind: 'frog', homeKey: null,
+    body: '#7ecb5f', accent: '#5da944', shirt: '#ffd95e',
+    lines: {
+      en: {
+        morning: [["Morning dew! Best drink on the island, ribbit!", "Don't knock it 'til you've tried it, {name}."],
+                  ["I did 100 hops before sunrise.", "Tomorrow: 101. Dream big, ribbit!"]],
+        afternoon: [["Nook pays GOOD bells for fossils!", "I'd dig them myself but... dirt. Ribbit."],
+                    ["Plant seeds and they grow in real minutes!", "Patience is a muscle, {name}. Ribbit!"]],
+        evening: [["Almost cricket o'clock! They take requests.", "They only know one song though. Ribbit..."],
+                  ["The pond gets all glittery at dusk.", "That's where I keep my best thoughts, ribbit."]],
+        night: [["The stars are out! I named that one Gerald.", "He's my favorite, ribbit."],
+                ["*hushed* The ocean sounds bigger at night.", "Kinda spooky. Kinda great. Ribbit."]],
+      },
+      es: {
+        morning: [["¡Rocío de la mañana! La mejor bebida de la isla, ¡croac!", "No lo critiques sin probarlo, {name}."],
+                  ["He dado 100 saltos antes del amanecer.", "Mañana: 101. Sueña a lo grande, ¡croac!"]],
+        afternoon: [["¡Nook paga BIEN los fósiles!", "Yo los desenterraría pero... tierra. Croac."],
+                    ["¡Si plantas semillas crecen en minutos reales!", "La paciencia es un músculo, {name}. ¡Croac!"]],
+        evening: [["¡Casi es la hora de los grillos! Aceptan peticiones.", "Aunque solo se saben una canción. Croac..."],
+                  ["El estanque se pone brillante al atardecer.", "Ahí guardo mis mejores ideas, croac."]],
+        night: [["¡Han salido las estrellas! A esa la llamé Gerardo.", "Es mi favorita, croac."],
+                ["*susurrando* El mar suena más grande de noche.", "Da un poco de miedo. Y un poco de gusto. Croac."]],
+      },
+    },
+  },
+  {
+    id: 'paco', name: 'Paco', kind: 'penguin', homeKey: 'home1',
+    body: '#3d4f63', accent: '#ffb347', shirt: '#7ec8ff',
+    lines: {
+      en: {
+        morning: [["Brrr! Perfect swimming weather!", "That's every weather, for the record."]],
+        afternoon: [["Thanks for building my house, {name}!", "Best landlord ever. Well. Only landlord."]],
+        evening: [["I waddled the whole coast today.", "My personal record: still waddling."]],
+        night: [["Cold nights remind me of home.", "Then I remember: this IS home now!"]],
+      },
+      es: {
+        morning: [["¡Brrr! ¡Tiempo perfecto para nadar!", "Que conste: para mí todos lo son."]],
+        afternoon: [["¡Gracias por construir mi casa, {name}!", "El mejor casero del mundo. Bueno. El único."]],
+        evening: [["Hoy he recorrido toda la costa andando como un pato.", "Mi récord personal: seguir andando como un pato."]],
+        night: [["Las noches frías me recuerdan a mi tierra.", "Y luego recuerdo: ¡ahora mi tierra es ESTA!"]],
+      },
+    },
+  },
+  {
+    id: 'luna', name: 'Luna', kind: 'wolf', homeKey: 'home2',
+    body: '#b9c2d6', accent: '#8d98b5', shirt: '#c9a7ff',
+    lines: {
+      en: {
+        morning: [["Up early? I like you already.", "The island is quietest before the shop opens."]],
+        afternoon: [["I'm cataloguing every flower on the island.", "Current count: many. Science takes time."]],
+        evening: [["Dusk is when the island shows its true colors.", "Literally. Look at that sky."]],
+        night: [["A wolf, awake at night? Shocking, I know.", "The moon and I have an understanding."]],
+      },
+      es: {
+        morning: [["¿Madrugando? Ya me caes bien.", "La isla está más tranquila antes de que abra la tienda."]],
+        afternoon: [["Estoy catalogando todas las flores de la isla.", "Recuento actual: muchas. La ciencia lleva tiempo."]],
+        evening: [["Al anochecer la isla enseña sus verdaderos colores.", "Literalmente. Mira ese cielo."]],
+        night: [["¿Una loba despierta de noche? Sorpresa, ya lo sé.", "La luna y yo tenemos un acuerdo."]],
+      },
+    },
+  },
+];
+let npcs = [];
+function npcActive(def) { return !def.homeKey || (prog && prog.built[def.homeKey]); }
+function spawnNpcs() {
+  npcs = [];
+  for (const def of NPC_DEFS) {
+    if (!npcActive(def)) continue;
+    addNpc(def);
+  }
+}
+function addNpc(def) {
+  let x = spawnPt.x + rnd(-60, 60), y = spawnPt.y + rnd(20, 80);
+  if (def.homeKey && plots[def.homeKey]) { x = plots[def.homeKey].x + rnd(-20, 20); y = plots[def.homeKey].y + rnd(20, 40); }
+  for (let t = 0; t < 60 && (tileAt(x, y) !== T_GRASS || insideBuilding(x, y)); t++) {
+    x = spawnPt.x + rnd(-120, 120); y = spawnPt.y + rnd(-60, 120);
+  }
+  npcs.push({ def, x, y, state: 'idle', t: rnd(2, 4), tx: 0, ty: 0, facing: 'down', step: 0 });
+}
+
+// ---------------- camera / projection ----------------
+const cam = { x: 0, by: 0 }; // by = world y at the bottom edge of the screen
+const proj = { SW: 0, SH: 0, R: 1, horizonY: 0 };
+function refreshProj() {
+  proj.SW = view.w / view.zoom;
+  proj.SH = view.h / view.zoom;
+  proj.R = proj.SH * 0.80;
+  proj.horizonY = proj.SH - proj.R * Math.sin(1.45);
+}
+function project(wx, wy) {
+  const b = cam.by - wy;
+  if (b <= 0) return { x: proj.SW / 2 + (wx - cam.x), y: proj.SH - b, c: 1, vis: b > -80 };
+  const ang = Math.min(b, proj.R * 1.42) / proj.R;
+  const s = proj.R * Math.sin(ang), c = Math.cos(ang);
+  return { x: proj.SW / 2 + (wx - cam.x) * c, y: proj.SH - s, c, vis: b < proj.R * 1.40 };
+}
+
+// ---------------- audio ----------------
+let AC = null;
+const audio = {
+  master: null, music: null, amb: null, sfx: null, muted: false,
+  nextNote: 0, eighth: 0, chord: 0, mel: 4, birdT: 1, cricketT: 1, noiseBuf: null,
+};
+const MUSIC_SET = {
+  morning: { bpm: 100, wave: 'triangle', density: 0.62, base: 72, padVol: 0.045, prog: [[60, 64, 67], [57, 60, 65], [59, 62, 67], [60, 64, 67]] },
+  afternoon: { bpm: 106, wave: 'triangle', density: 0.55, base: 72, padVol: 0.04, prog: [[60, 64, 67], [57, 60, 64], [53, 57, 60], [59, 62, 67]] },
+  evening: { bpm: 82, wave: 'sine', density: 0.45, base: 72, padVol: 0.05, prog: [[57, 60, 64], [53, 57, 60], [60, 64, 67], [59, 62, 67]] },
+  night: { bpm: 58, wave: 'sine', density: 0.26, base: 67, padVol: 0.04, prog: [[57, 60, 64], [55, 59, 64], [53, 57, 60], [55, 59, 64]] },
+};
+const PENTA = [0, 2, 4, 7, 9];
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+function initAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  const Ctor = window.AudioContext || window.webkitAudioContext;
+  if (!Ctor) return;
+  AC = new Ctor();
+  audio.master = AC.createGain(); audio.master.gain.value = audio.muted ? 0 : 0.6; audio.master.connect(AC.destination);
+  audio.music = AC.createGain(); audio.music.gain.value = 0.16; audio.music.connect(audio.master);
+  audio.amb = AC.createGain(); audio.amb.gain.value = 0.6; audio.amb.connect(audio.master);
+  audio.sfx = AC.createGain(); audio.sfx.gain.value = 0.5; audio.sfx.connect(audio.master);
+  const len = AC.sampleRate * 2;
+  audio.noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+  const data = audio.noiseBuf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  function noiseLayer(type, freq, q, baseGain, lfoHz, lfoDepth) {
+    const src = AC.createBufferSource(); src.buffer = audio.noiseBuf; src.loop = true;
+    const f = AC.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+    const g = AC.createGain(); g.gain.value = baseGain;
+    const lfo = AC.createOscillator(); lfo.frequency.value = lfoHz;
+    const lg = AC.createGain(); lg.gain.value = lfoDepth;
+    lfo.connect(lg); lg.connect(g.gain);
+    src.connect(f); f.connect(g); g.connect(audio.amb);
+    src.start(); lfo.start();
+  }
+  noiseLayer('bandpass', 500, 0.4, 0.045, 0.07, 0.03);  // wind
+  noiseLayer('lowpass', 420, 0.7, 0.06, 0.13, 0.05);    // waves
+  audio.nextNote = AC.currentTime + 0.1;
+}
+function tone({ f, t, dur, type = 'triangle', vol = 0.15, dest = null, slide = 0 }) {
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f, t);
+  if (slide) o.frequency.exponentialRampToValueAtTime(slide, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(dest || audio.music);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+function noiseBurst(t, dur, freq, vol) {
+  const src = AC.createBufferSource(); src.buffer = audio.noiseBuf;
+  const f = AC.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = freq;
+  const g = AC.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f); f.connect(g); g.connect(audio.sfx);
+  src.start(t); src.stop(t + dur + 0.05);
+}
+function musicTick() {
+  if (!AC) return;
+  if (audio.nextNote < AC.currentTime - 0.2) audio.nextNote = AC.currentTime + 0.1;
+  const set = MUSIC_SET[dayPeriod()];
+  const eighthLen = 60 / set.bpm / 2;
+  while (audio.nextNote < AC.currentTime + 0.4) {
+    const t = audio.nextNote, pos = audio.eighth % 8;
+    const chord = set.prog[audio.chord % set.prog.length];
+    if (pos === 0) {
+      chord.forEach(m => tone({ f: mtof(m), t, dur: eighthLen * 7.6, type: 'sine', vol: set.padVol }));
+      tone({ f: mtof(chord[0] - 24), t, dur: eighthLen * 3.5, type: 'triangle', vol: 0.10 });
+    }
+    if (pos === 4) tone({ f: mtof(chord[0] - 12), t, dur: eighthLen * 3, type: 'triangle', vol: 0.07 });
+    if (Math.random() < set.density && pos !== 0) {
+      audio.mel = clamp(audio.mel + Math.floor(rnd(-2, 3)), 0, 9);
+      const m = set.base + PENTA[audio.mel % 5] + 12 * Math.floor(audio.mel / 5);
+      tone({ f: mtof(m), t, dur: eighthLen * rnd(1.1, 2.2), type: set.wave, vol: 0.085 });
+    }
+    audio.eighth++;
+    if (audio.eighth % 8 === 0) audio.chord++;
+    audio.nextNote += eighthLen;
+  }
+}
+function ambientTick(dt) {
+  if (!AC) return;
+  const p = dayPeriod(), t = AC.currentTime;
+  if (p === 'morning' || p === 'afternoon') {
+    audio.birdT -= dt;
+    if (audio.birdT <= 0) {
+      audio.birdT = p === 'morning' ? rnd(0.8, 3.5) : rnd(4, 10);
+      const n = 2 + Math.floor(rnd(3)), f0 = rnd(2300, 3300);
+      for (let i = 0; i < n; i++) {
+        tone({ f: f0 * rnd(0.92, 1.1), t: t + i * rnd(0.09, 0.15), dur: 0.09, type: 'sine', vol: 0.04, dest: audio.amb, slide: f0 * rnd(1.15, 1.4) });
+      }
+    }
+  }
+  if (p === 'night' || p === 'evening') {
+    audio.cricketT -= dt;
+    if (audio.cricketT <= 0) {
+      audio.cricketT = rnd(0.5, 1.6);
+      for (let i = 0; i < 3; i++) {
+        tone({ f: 4200 + rnd(-200, 200), t: t + i * 0.07, dur: 0.045, type: 'sine', vol: 0.022, dest: audio.amb });
+      }
+    }
+  }
+}
+const SFX = {
+  pickup() { if (!AC) return; const t = AC.currentTime;
+    tone({ f: 880, t, dur: 0.09, type: 'square', vol: 0.05, dest: audio.sfx });
+    tone({ f: 1318, t: t + 0.08, dur: 0.14, type: 'square', vol: 0.05, dest: audio.sfx }); },
+  sell() { if (!AC) return; const t = AC.currentTime;
+    [987, 1318, 1975].forEach((f, i) => tone({ f, t: t + i * 0.07, dur: 0.18, type: 'triangle', vol: 0.08, dest: audio.sfx })); },
+  error() { if (!AC) return; tone({ f: 196, t: AC.currentTime, dur: 0.2, type: 'square', vol: 0.06, dest: audio.sfx }); },
+  blip() { if (!AC) return; tone({ f: rnd(480, 760), t: AC.currentTime, dur: 0.04, type: 'square', vol: 0.025, dest: audio.sfx }); },
+  dig() { if (!AC) return; noiseBurst(AC.currentTime, 0.18, 600, 0.2); },
+  splash() { if (!AC) return; noiseBurst(AC.currentTime, 0.3, 1400, 0.22);
+    tone({ f: 520, t: AC.currentTime, dur: 0.2, type: 'sine', vol: 0.06, dest: audio.sfx, slide: 180 }); },
+  plant() { if (!AC) return; noiseBurst(AC.currentTime, 0.12, 500, 0.14);
+    tone({ f: 660, t: AC.currentTime + 0.1, dur: 0.12, type: 'sine', vol: 0.05, dest: audio.sfx }); },
+  build() { if (!AC) return; const t = AC.currentTime;
+    for (let i = 0; i < 5; i++) noiseBurst(t + i * 0.13, 0.06, 900, 0.16);
+    [659, 784, 988, 1318].forEach((f, i) => tone({ f, t: t + 0.7 + i * 0.09, dur: 0.25, type: 'triangle', vol: 0.08, dest: audio.sfx })); },
+  coffee() { if (!AC) return; const t = AC.currentTime;
+    tone({ f: 740, t, dur: 0.1, type: 'sine', vol: 0.06, dest: audio.sfx });
+    tone({ f: 1108, t: t + 0.1, dur: 0.16, type: 'sine', vol: 0.06, dest: audio.sfx }); },
+};
+
+// ---------------- input / state machine ----------------
+const keys = {};
+let state = 'title'; // title | slots | intro | play
+let fade = 0, fadeDir = 0, fadeCb = null;
+function startFade(cb) { fadeDir = 1; fadeCb = cb; }
+
+const slotsUI = { sel: 0, delArm: -1, delT: 0 };
+const ui = { mode: null, sel: 0, tab: 0, sub: null }; // inv | nook | shop | museum | cafe | pause
+let minimapOn = true;
+const toasts = [];
+function toast(text) { toasts.push({ text, t: 0 }); }
+
+window.addEventListener('keydown', e => {
+  if (document.activeElement === nameInput) {
+    if (e.key === 'Enter') confirmName();
+    return;
+  }
+  initAudio();
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'Tab'].includes(e.key)) e.preventDefault();
+  keys[e.code] = true;
+  handlePress(e.code);
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+cv.addEventListener('pointerdown', () => {
+  initAudio();
+  if (state === 'title' || state === 'slots') handlePress('Enter');
+  else if (dlg.open || (state === 'intro')) handlePress('KeyE');
+});
+
+// ---------------- dialogue (typewriter) ----------------
+const dlg = { open: false, lines: [], li: 0, shown: 0, speaker: '', color: '#7a5230', cb: null };
+function startDialog(speaker, color, lines, cb) {
+  dlg.open = true; dlg.speaker = speaker; dlg.color = color;
+  dlg.lines = lines.map(l => l.split('{name}').join(player.name || '...'));
+  dlg.li = 0; dlg.shown = 0; dlg.cb = cb || null;
+}
+function advanceDialog() {
+  const line = dlg.lines[dlg.li];
+  if (dlg.shown < line.length) { dlg.shown = line.length; return; }
+  dlg.li++; dlg.shown = 0;
+  if (dlg.li >= dlg.lines.length) {
+    dlg.open = false;
+    if (dlg.cb) { const cb = dlg.cb; dlg.cb = null; cb(); }
+  }
+}
+
+// ---------------- intro ----------------
+const intro = { active: false, idx: 0, shown: 0, waitingInput: false, script: [] };
+function buildIntroScript() {
+  intro.script = T('intro_lines');
+  intro.idx = 0; intro.shown = 0; intro.waitingInput = false; intro.active = true;
+}
+function confirmName() {
+  const v = nameInput.value.trim();
+  if (!v) return;
+  player.name = v.slice(0, 12);
+  nameInput.style.display = 'none';
+  nameInput.blur();
+  intro.waitingInput = false;
+  intro.idx++; intro.shown = 0;
+  persist();
+  SFX.pickup();
+}
+function advanceIntro() {
+  const item = intro.script[intro.idx];
+  if (item === undefined) return;
+  if (item === '@INPUT') return;
+  const text = item.split('{name}').join(player.name);
+  if (intro.shown < text.length) { intro.shown = text.length; return; }
+  intro.idx++; intro.shown = 0;
+  const next = intro.script[intro.idx];
+  if (next === undefined) {
+    intro.active = false;
+    startFade(() => { state = 'play'; toast(T('welcome')); persist(); });
+  } else if (next === '@INPUT') {
+    intro.waitingInput = true;
+    nameInput.style.display = 'block';
+    nameInput.value = '';
+    setTimeout(() => { try { nameInput.focus(); } catch (e) {} }, 50);
+  }
+}
+
+// ---------------- slot management ----------------
+function enterSlot(i) {
+  const data = readSlot(i);
+  currentSlot = i;
+  if (data && data.name) {
+    prog = { seed: data.seed, createdAt: data.createdAt, built: data.built || {}, tools: data.tools || {}, donated: data.donated || {}, lastGift: data.lastGift || '', star: !!data.star };
+    player.name = data.name; player.bells = data.bells ?? 100; player.inv = data.inv || {};
+    genWorld(prog.seed);
+    plants = (data.plants || []).map(p => ({ x: p.x, y: p.y, t0: p.t0 }));
+    bootIsland();
+    startFade(() => { state = 'play'; toast(T('welcome_back', { n: player.name })); });
+  } else {
+    prog = freshProg(Math.floor(Math.random() * 1e9));
+    player.name = ''; player.bells = 150; player.inv = {}; player.coffeeUntil = 0;
+    genWorld(prog.seed);
+    plants = [];
+    bootIsland();
+    startFade(() => { state = 'intro'; buildIntroScript(); });
+  }
+}
+function bootIsland() {
+  refreshRects();
+  groundItems.length = 0;
+  fillSpawns(true);
+  spawnNpcs();
+  player.x = spawnPt.x; player.y = spawnPt.y;
+  player.coffeeUntil = 0;
+  cam.x = player.x; cam.by = player.y + proj.SH * 0.30;
+  ui.mode = null; dlg.open = false;
+}
+function slotSummary(i) {
+  const d = readSlot(i);
+  if (!d || !d.name) return null;
+  const days = Math.floor((Date.now() - (d.createdAt || Date.now())) / 86400e3) + 1;
+  const builtCount = PROJECTS.filter(p => d.built && d.built[p.key]).length;
+  return { name: d.name, bells: d.bells ?? 0, days, builtCount, star: !!d.star };
+}
+
+// ---------------- key handling ----------------
+function handlePress(code) {
+  if (fadeDir !== 0) return;
+
+  if (code === 'KeyL' && state !== 'intro') {
+    setLang(lang === 'en' ? 'es' : 'en');
+    if (state === 'play') toast(lang === 'es' ? 'Idioma: Español' : 'Language: English');
+    return;
+  }
+
+  if (state === 'title') {
+    if (code === 'Enter' || code === 'Space' || code === 'KeyE') { state = 'slots'; SFX.pickup(); }
+    return;
+  }
+
+  if (state === 'slots') {
+    if (code === 'Escape') { state = 'title'; return; }
+    if (code === 'ArrowUp') { slotsUI.sel = (slotsUI.sel + 2) % 3; slotsUI.delArm = -1; SFX.blip(); return; }
+    if (code === 'ArrowDown') { slotsUI.sel = (slotsUI.sel + 1) % 3; slotsUI.delArm = -1; SFX.blip(); return; }
+    if (code === 'Digit1' || code === 'Digit2' || code === 'Digit3') {
+      slotsUI.sel = Number(code.slice(-1)) - 1; slotsUI.delArm = -1; SFX.blip(); return;
+    }
+    if (code === 'KeyX') {
+      if (!readSlot(slotsUI.sel)) return;
+      if (slotsUI.delArm === slotsUI.sel) {
+        try { localStorage.removeItem(SLOT_KEY(slotsUI.sel)); } catch (e) {}
+        slotsUI.delArm = -1; SFX.dig();
+      } else { slotsUI.delArm = slotsUI.sel; slotsUI.delT = 3; SFX.error(); }
+      return;
+    }
+    if (code === 'Enter' || code === 'Space' || code === 'KeyE') { SFX.pickup(); enterSlot(slotsUI.sel); }
+    return;
+  }
+
+  if (state === 'intro') {
+    if (code === 'Enter' || code === 'Space' || code === 'KeyE') advanceIntro();
+    return;
+  }
+
+  // ---- play ----
+  if (code === 'KeyM') {
+    audio.muted = !audio.muted;
+    if (audio.master) audio.master.gain.value = audio.muted ? 0 : 0.6;
+    toast(audio.muted ? T('sound_off') : T('sound_on'));
+    return;
+  }
+  if (dlg.open) {
+    if (code === 'KeyE' || code === 'Enter' || code === 'Space') advanceDialog();
+    return;
+  }
+  if (ui.mode) { uiKey(code); return; }
+
+  if (code === 'KeyI') { openUI('inv'); return; }
+  if (code === 'Escape') { openUI('pause'); return; }
+  if (code === 'Tab') { minimapOn = !minimapOn; SFX.blip(); return; }
+  if (code === 'KeyE' || code === 'Enter') doInteract();
+  if (code === 'KeyP') doPlant();
+}
+function openUI(mode) {
+  ui.mode = mode; ui.sel = 0; ui.tab = 0; ui.sub = null;
+  SFX.blip();
+}
+function closeUI() { ui.mode = null; SFX.blip(); persist(); }
+
+// ---------------- interactions ----------------
+function nearestInteract() {
+  for (const n of npcs) if (dist(player.x, player.y, n.x, n.y) < 26) return { kind: 'npc', obj: n };
+  // Nook stands by the tent
+  if (dist(player.x, player.y, plots.tent.x + 28, plots.tent.y + 8) < 30) return { kind: 'nook' };
+  for (const b of activeBuildings()) {
+    if (b.key === 'tent') continue;
+    if (dist(player.x, player.y, b.x, b.y + 10) < 32) {
+      if (b.key === 'shop') return { kind: 'shop' };
+      if (b.key === 'museum') return { kind: 'museum' };
+      if (b.key === 'cafe') return { kind: 'cafe' };
+      if (b.key === 'house') return { kind: 'house' };
+    }
+  }
+  let best = null, bd = 1e9;
+  for (const it of groundItems) {
+    const d = dist(player.x, player.y, it.x, it.y);
+    const reach = it.type === 'fish' ? 36 : 22;
+    if ((it.type === 'fish' || it.type === 'fossil') && d < reach && d < bd) { best = { kind: it.type, obj: it }; bd = d; }
+  }
+  if (best) return best;
+  for (const p of plants) {
+    if (plantStage(p) === 3 && dist(player.x, player.y, p.x, p.y) < 20) return { kind: 'harvest', obj: p };
+  }
+  return null;
+}
+function doInteract() {
+  const tgt = nearestInteract();
+  if (!tgt) return;
+  if (tgt.kind === 'npc') {
+    const n = tgt.obj;
+    n.state = 'idle'; n.t = rnd(3, 5);
+    n.facing = player.x < n.x ? 'left' : 'right';
+    const sets = n.def.lines[lang] || n.def.lines.en;
+    startDialog(n.def.name, n.def.shirt, pick(sets[dayPeriod()]));
+  } else if (tgt.kind === 'nook') {
+    openUI('nook');
+  } else if (tgt.kind === 'shop') {
+    openUI('shop');
+  } else if (tgt.kind === 'museum') {
+    openUI('museum');
+  } else if (tgt.kind === 'cafe') {
+    openUI('cafe');
+  } else if (tgt.kind === 'house') {
+    const today = new Date().toISOString().slice(0, 10);
+    if (prog.lastGift !== today) {
+      prog.lastGift = today;
+      player.bells += GIFT_BELLS;
+      toast(T('gift', { b: GIFT_BELLS }));
+      SFX.sell();
+    } else {
+      toast(T('rested'));
+      SFX.blip();
+    }
+    persist();
+  } else if (tgt.kind === 'fish') {
+    if (!prog.tools.rod) { toast(T('need_rod')); SFX.error(); return; }
+    groundItems.splice(groundItems.indexOf(tgt.obj), 1);
+    addItem('fish'); SFX.splash(); toast(T('caught')); persist();
+  } else if (tgt.kind === 'fossil') {
+    if (!prog.tools.shovel) { toast(T('need_shovel')); SFX.error(); return; }
+    groundItems.splice(groundItems.indexOf(tgt.obj), 1);
+    addItem('fossil'); SFX.dig(); toast(T('dug')); persist();
+  } else if (tgt.kind === 'harvest') {
+    plants.splice(plants.indexOf(tgt.obj), 1);
+    addItem('flower'); SFX.pickup(); toast(T('harvest')); persist();
+  }
+}
+function doPlant() {
+  if (!(player.inv.seeds > 0)) { toast(T('no_seeds')); SFX.error(); return; }
+  const px = player.x, py = player.y + 6;
+  if (tileAt(px, py) !== T_GRASS || insideBuilding(px, py)) { toast(T('need_grass')); SFX.error(); return; }
+  if (plants.some(p => dist(p.x, p.y, px, py) < 18) || trees.some(t => dist(t.x, t.y, px, py) < 22)) {
+    toast(T('crowded')); SFX.error(); return;
+  }
+  player.inv.seeds--;
+  plants.push({ x: px, y: py, t0: Date.now() });
+  SFX.plant(); toast(T('planted')); persist();
+}
+
+// ---------------- menus logic ----------------
+function sellFactor() { return ui.mode === 'shop' ? 1 : 0.8; }
+function sellRows() { return INV_ORDER.filter(t => (player.inv[t] || 0) > 0); }
+function buyRows() {
+  if (ui.mode === 'shop') return ['seeds'];
+  const r = ['seeds'];
+  if (!prog.tools.rod) r.unshift('rod');
+  if (!prog.tools.shovel) r.splice(prog.tools.rod ? 0 : 1, 0, 'shovel');
+  return r;
+}
+function doSell(type, all) {
+  const n = all ? (player.inv[type] || 0) : 1;
+  if (n <= 0) { SFX.error(); return; }
+  const price = Math.round(ITEMS[type].sell * sellFactor());
+  player.inv[type] -= n;
+  player.bells += price * n;
+  SFX.sell();
+  toast(T('sold', { b: price * n, n, i: T('i_' + type) }));
+  persist();
+}
+function doBuy(type) {
+  const cost = ITEMS[type].buy;
+  if ((type === 'rod' && prog.tools.rod) || (type === 'shovel' && prog.tools.shovel)) { toast(T('own')); SFX.error(); return; }
+  if (player.bells < cost) { toast(T('no_bells')); SFX.error(); return; }
+  player.bells -= cost;
+  if (type === 'rod' || type === 'shovel') prog.tools[type] = true;
+  else addItem(type);
+  SFX.sell(); toast(T('bought', { i: T('i_' + type) })); persist();
+}
+function doBuild(idx) {
+  const p = PROJECTS[idx];
+  if (prog.built[p.key]) { toast(T('already_built')); SFX.error(); return; }
+  if (idx > 0 && !prog.built[PROJECTS[idx - 1].key]) {
+    toast(T('locked_prev', { b: T('b_' + PROJECTS[idx - 1].key) })); SFX.error(); return;
+  }
+  if (player.bells < p.cost) { toast(T('no_bells')); SFX.error(); return; }
+  player.bells -= p.cost;
+  prog.built[p.key] = true;
+  refreshRects();
+  const plot = plots[p.key];
+  const dx = plot.x - player.x, dy = plot.y - player.y;
+  const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? T('east') : T('west')) : (dy > 0 ? T('south') : T('north'));
+  toast(T('built_done', { b: T('b_' + p.key), d: dir }));
+  SFX.build();
+  const def = NPC_DEFS.find(d => d.homeKey === p.key);
+  if (def) { addNpc(def); toast(T('new_neighbor', { n: def.name })); }
+  persist();
+}
+function doDonate(type) {
+  if (prog.donated[type]) { toast(T('donate_has')); SFX.error(); return; }
+  if (!(player.inv[type] > 0)) { toast(T('donate_none')); SFX.error(); return; }
+  player.inv[type]--;
+  prog.donated[type] = true;
+  player.bells += DONATE_GRANT;
+  toast(T('donate_done', { b: DONATE_GRANT }));
+  SFX.sell();
+  if (DONATABLE.every(t => prog.donated[t]) && !prog.star) {
+    prog.star = true;
+    player.bells += COMPLETE_BONUS;
+    toast(T('museum_complete', { b: COMPLETE_BONUS }));
+    SFX.build();
+  }
+  persist();
+}
+
+function uiKey(code) {
+  if (code === 'Escape') {
+    if (ui.mode === 'nook' && ui.sub) { ui.sub = null; ui.sel = 0; SFX.blip(); return; }
+    closeUI(); return;
+  }
+  if (ui.mode === 'inv') {
+    if (code === 'KeyI' || code === 'KeyE') closeUI();
+    return;
+  }
+  if (ui.mode === 'pause') {
+    const n = 3;
+    if (code === 'ArrowUp') { ui.sel = (ui.sel + n - 1) % n; SFX.blip(); return; }
+    if (code === 'ArrowDown') { ui.sel = (ui.sel + 1) % n; SFX.blip(); return; }
+    if (code === 'Enter' || code === 'Space' || code === 'KeyE') {
+      if (ui.sel === 0) closeUI();
+      else if (ui.sel === 1) { setLang(lang === 'en' ? 'es' : 'en'); SFX.blip(); }
+      else { persist(); ui.mode = null; startFade(() => { state = 'slots'; slotsUI.delArm = -1; }); }
+    }
+    return;
+  }
+  if (ui.mode === 'cafe') {
+    if (code === 'Enter' || code === 'Space' || code === 'KeyE') {
+      if (player.bells < ITEMS.coffee.buy) { toast(T('no_bells')); SFX.error(); return; }
+      player.bells -= ITEMS.coffee.buy;
+      player.coffeeUntil = Date.now() + COFFEE_DUR * 1000;
+      SFX.coffee(); toast(T('coffee_on')); persist();
+      closeUI();
+    }
+    return;
+  }
+  if (ui.mode === 'museum') {
+    const rows = DONATABLE;
+    if (code === 'ArrowUp') { ui.sel = (ui.sel + rows.length - 1) % rows.length; SFX.blip(); return; }
+    if (code === 'ArrowDown') { ui.sel = (ui.sel + 1) % rows.length; SFX.blip(); return; }
+    if (code === 'Enter' || code === 'Space' || code === 'KeyE') doDonate(rows[ui.sel]);
+    return;
+  }
+  if (ui.mode === 'nook' && ui.sub === 'build') { uiKeyBuild(code); return; }
+  if (ui.mode === 'shop' || (ui.mode === 'nook' && (ui.sub === 'sell' || ui.sub === 'buy'))) {
+    const selling = ui.mode === 'shop' ? ui.tab === 0 : ui.sub === 'sell';
+    const rows = selling ? sellRows() : buyRows();
+    if (ui.mode === 'shop' && (code === 'ArrowLeft' || code === 'ArrowRight' || code === 'Tab')) {
+      ui.tab = 1 - ui.tab; ui.sel = 0; SFX.blip(); return;
+    }
+    if (code === 'ArrowUp') { ui.sel = Math.max(0, ui.sel - 1); SFX.blip(); return; }
+    if (code === 'ArrowDown') { ui.sel = Math.min(Math.max(0, rows.length - 1), ui.sel + 1); SFX.blip(); return; }
+    if (code === 'Enter' || code === 'Space' || code === 'KeyA') {
+      const type = rows[ui.sel];
+      if (!type) { SFX.error(); return; }
+      if (selling) {
+        doSell(type, code === 'KeyA');
+        ui.sel = Math.min(ui.sel, Math.max(0, sellRows().length - 1));
+      } else doBuy(type);
+    }
+    return;
+  }
+  if (ui.mode === 'nook') { // root menu
+    const rows = ['sell', 'buy', 'build', 'chat', 'leave'];
+    if (code === 'ArrowUp') { ui.sel = (ui.sel + rows.length - 1) % rows.length; SFX.blip(); return; }
+    if (code === 'ArrowDown') { ui.sel = (ui.sel + 1) % rows.length; SFX.blip(); return; }
+    if (code === 'Enter' || code === 'Space' || code === 'KeyE') {
+      const r = rows[ui.sel];
+      if (r === 'leave') { closeUI(); return; }
+      if (r === 'chat') {
+        ui.mode = null;
+        startDialog('Tom Nook', '#3f7a4c', [pick(T('nook_chat'))], () => { openUI('nook'); });
+        return;
+      }
+      if (r === 'build') { ui.sub = 'build'; ui.sel = 0; SFX.blip(); return; }
+      ui.sub = r; ui.sel = 0; SFX.blip();
+    }
+    return;
+  }
+}
+// nook build submenu handled here (separate because rows differ)
+function uiKeyBuild(code) {
+  const rows = PROJECTS;
+  if (code === 'ArrowUp') { ui.sel = (ui.sel + rows.length - 1) % rows.length; SFX.blip(); return; }
+  if (code === 'ArrowDown') { ui.sel = (ui.sel + 1) % rows.length; SFX.blip(); return; }
+  if (code === 'Enter' || code === 'Space' || code === 'KeyE') doBuild(ui.sel);
+}
+
+// ---------------- objective ----------------
+function currentObjective() {
+  if (!prog) return null;
+  if (!prog.tools.rod) return T('obj_rod', { c: ITEMS.rod.buy });
+  if (!prog.built.house) return T('obj_house', { c: PROJECTS[0].cost });
+  if (!prog.tools.shovel) return T('obj_shovel', { c: ITEMS.shovel.buy });
+  if (!prog.built.shop) return T('obj_shop', { c: PROJECTS[1].cost });
+  if (!prog.built.museum) return T('obj_museum', { c: PROJECTS[2].cost });
+  if (!prog.built.cafe) return T('obj_cafe', { c: PROJECTS[3].cost });
+  if (!prog.built.home1) return T('obj_home1', { c: PROJECTS[4].cost });
+  if (!prog.built.home2) return T('obj_home2', { c: PROJECTS[5].cost });
+  if (!prog.star) return T('obj_donate');
+  return T('obj_done');
+}
+
+// ---------------- clouds & particles ----------------
+const clouds = [];
+for (let i = 0; i < 8; i++) clouds.push({ x: rnd(2400), y: rnd(0.12, 0.85), s: rnd(0.5, 1.2), v: rnd(3, 8) });
+const particles = [];
+function spawnParticle(w, h) {
+  if (SEASON === 'winter') particles.push({ x: rnd(w), y: -10, vx: rnd(-8, 8), vy: rnd(18, 40), ph: rnd(TAU), kind: 'snow', life: 30 });
+  else if (SEASON === 'autumn') particles.push({ x: rnd(w), y: -10, vx: rnd(-15, 5), vy: rnd(22, 42), ph: rnd(TAU), kind: 'leaf', life: 30, c: pick(['#d8842f', '#c4622d', '#e0a83a']) });
+  else if (SEASON === 'spring') particles.push({ x: rnd(w), y: -10, vx: rnd(-12, 12), vy: rnd(14, 30), ph: rnd(TAU), kind: 'petal', life: 30 });
+  else particles.push({ x: rnd(w), y: rnd(h), vx: rnd(-6, 6), vy: rnd(-4, 4), ph: rnd(TAU), kind: 'spark', life: rnd(3, 6) });
+}
+
+// ---------------- update ----------------
+let lastT = performance.now();
+let persistT = 0;
+
+function update(dt) {
+  musicTick();
+  ambientTick(dt);
+
+  if (fadeDir === 1) {
+    fade = Math.min(1, fade + dt * 2.2);
+    if (fade >= 1) { fadeDir = -1; if (fadeCb) { const cb = fadeCb; fadeCb = null; cb(); } }
+  } else if (fadeDir === -1) {
+    fade = Math.max(0, fade - dt * 1.5);
+    if (fade <= 0) fadeDir = 0;
+  }
+
+  const targetN = SEASON === 'summer' ? 14 : 36;
+  if (particles.length < targetN && Math.random() < 0.3) spawnParticle(view.w, view.h);
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.ph += dt * 2;
+    p.x += (p.vx + Math.sin(p.ph) * 12) * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+    if (p.y > view.h + 12 || p.life <= 0) particles.splice(i, 1);
+  }
+  clouds.forEach(c => { c.x += c.v * dt; });
+  if (slotsUI.delArm >= 0) { slotsUI.delT -= dt; if (slotsUI.delT <= 0) slotsUI.delArm = -1; }
+
+  if (state === 'intro' && !intro.waitingInput) {
+    const item = intro.script[intro.idx];
+    if (item && item !== '@INPUT') {
+      const len = item.length, prev = intro.shown;
+      intro.shown = Math.min(len, intro.shown + dt * 32);
+      if (Math.floor(intro.shown / 2) !== Math.floor(prev / 2) && intro.shown < len) SFX.blip();
+    }
+  }
+  if (state !== 'play') return;
+
+  // movement
+  const locked = dlg.open || ui.mode;
+  let mx = 0, my = 0;
+  if (!locked) {
+    if (keys.KeyA || keys.ArrowLeft) mx -= 1;
+    if (keys.KeyD || keys.ArrowRight) mx += 1;
+    if (keys.KeyW || keys.ArrowUp) my -= 1;
+    if (keys.KeyS || keys.ArrowDown) my += 1;
+  }
+  player.moving = mx !== 0 || my !== 0;
+  if (player.moving) {
+    const coffee = Date.now() < player.coffeeUntil ? 1.35 : 1;
+    const sp = (keys.ShiftLeft || keys.ShiftRight ? 150 : 105) * coffee * dt;
+    const dia = mx !== 0 && my !== 0 ? 0.7071 : 1;
+    tryMove(player, mx * sp * dia, my * sp * dia);
+    player.facing = Math.abs(mx) > Math.abs(my) ? (mx < 0 ? 'left' : 'right') : (my < 0 ? 'up' : 'down');
+    player.step += dt * 11;
+  }
+
+  // auto-pickup
+  for (let i = groundItems.length - 1; i >= 0; i--) {
+    const it = groundItems[i];
+    if ((it.type === 'shell' || it.type === 'fruit') && dist(player.x, player.y, it.x, it.y) < 13) {
+      groundItems.splice(i, 1);
+      addItem(it.type); SFX.pickup();
+      toast(T('got', { i: T('i_' + it.type) }));
+    }
+  }
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) { spawnTimer = 5; fillSpawns(false); }
+
+  for (const it of groundItems) {
+    if (it.type !== 'fish') continue;
+    it.ph += dt;
+    const nx = it.x + Math.cos(it.ph * 0.6) * 6 * dt, ny = it.y + Math.sin(it.ph * 0.4) * 6 * dt;
+    if (tileAt(nx, ny) === T_WATER) { it.x = nx; it.y = ny; }
+  }
+
+  for (const n of npcs) {
+    n.t -= dt;
+    if (n.state === 'idle') {
+      if (n.t <= 0) {
+        for (let k = 0; k < 12; k++) {
+          const a = rnd(TAU), d = rnd(24, 70);
+          const tx = n.x + Math.cos(a) * d, ty = n.y + Math.sin(a) * d;
+          if (tileAt(tx, ty) === T_GRASS && !insideBuilding(tx, ty)) { n.tx = tx; n.ty = ty; n.state = 'walk'; break; }
+        }
+        n.t = rnd(2, 5);
+      }
+    } else {
+      const dx = n.tx - n.x, dy = n.ty - n.y, d = Math.hypot(dx, dy);
+      if (d < 3 || n.t < -6) { n.state = 'idle'; n.t = rnd(1.5, 4.5); }
+      else {
+        const sp = 26 * dt;
+        tryMove(n, dx / d * sp, dy / d * sp);
+        n.facing = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : (dy < 0 ? 'up' : 'down');
+        n.step += dt * 8;
+      }
+    }
+  }
+
+  if (dlg.open) {
+    const line = dlg.lines[dlg.li], prev = dlg.shown;
+    dlg.shown = Math.min(line.length, dlg.shown + dt * 34);
+    if (Math.floor(dlg.shown / 2) !== Math.floor(prev / 2) && dlg.shown < line.length) SFX.blip();
+  }
+  for (let i = toasts.length - 1; i >= 0; i--) {
+    toasts[i].t += dt;
+    if (toasts[i].t > 2.8) toasts.splice(i, 1);
+  }
+
+  // camera
+  refreshProj();
+  const k = 1 - Math.pow(0.002, dt);
+  cam.x = lerp(cam.x, clamp(player.x, 60, WORLD_W - 60), k);
+  cam.by = lerp(cam.by, player.y + proj.SH * 0.30, k);
+
+  persistT += dt;
+  if (persistT > 12) { persistT = 0; persist(); }
+}
+
+function tryMove(ent, dx, dy) {
+  const passable = (x, y) =>
+    isLand(x, y) && !insideBuilding(x, y) &&
+    trees.every(t => dist(x, y, t.x, t.y) > 9) &&
+    rocks.every(r => dist(x, y, r.x, r.y) > 10);
+  if (passable(ent.x + dx, ent.y)) ent.x += dx;
+  if (passable(ent.x, ent.y + dy)) ent.y += dy;
+  ent.x = clamp(ent.x, 8, WORLD_W - 8);
+  ent.y = clamp(ent.y, 8, WORLD_H - 8);
+}
+
+/* ==================================================================
+   RENDERING
+   ================================================================== */
+let vignetteCv = null;
+function makeVignette() {
+  vignetteCv = document.createElement('canvas');
+  vignetteCv.width = Math.max(2, Math.floor(view.w / 2));
+  vignetteCv.height = Math.max(2, Math.floor(view.h / 2));
+  const g = vignetteCv.getContext('2d');
+  const grad = g.createRadialGradient(
+    vignetteCv.width / 2, vignetteCv.height / 2, Math.min(vignetteCv.width, vignetteCv.height) * 0.42,
+    vignetteCv.width / 2, vignetteCv.height / 2, Math.max(vignetteCv.width, vignetteCv.height) * 0.72);
+  grad.addColorStop(0, 'rgba(20,15,40,0)');
+  grad.addColorStop(1, 'rgba(20,15,40,0.38)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, vignetteCv.width, vignetteCv.height);
+}
+
+// ----- sprites (drawn relative to feet at 0,0) -----
+function drawShadowS(w) {
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.beginPath(); ctx.ellipse(0, 1, w, w * 0.4, 0, 0, TAU); ctx.fill();
+}
+function faceOffset(facing) {
+  return facing === 'left' ? [-2, 0] : facing === 'right' ? [2, 0] : facing === 'up' ? [0, -1.5] : [0, 0.5];
+}
+function drawEyesS(y, facing, blink) {
+  if (facing === 'up') return;
+  const [ox, oy] = faceOffset(facing);
+  ctx.fillStyle = '#2b2018';
+  if (blink) {
+    ctx.fillRect(-3 + ox, y + oy, 2.4, 0.8);
+    ctx.fillRect(1 + ox, y + oy, 2.4, 0.8);
+  } else {
+    ctx.fillRect(-3 + ox, y - 1 + oy, 2, 2.6);
+    ctx.fillRect(1.4 + ox, y - 1 + oy, 2, 2.6);
+  }
+}
+function drawBodyS(facing, step, moving, shirt) {
+  const lift = moving ? Math.abs(Math.sin(step)) * 1.4 : 0;
+  ctx.fillStyle = '#9a6b3f';
+  const l1 = moving ? Math.sin(step) * 2 : 0, l2 = -l1;
+  ctx.fillRect(-3.5, -4 + Math.max(0, l1), 3, 4 - Math.max(0, l1));
+  ctx.fillRect(0.5, -4 + Math.max(0, l2), 3, 4 - Math.max(0, l2));
+  ctx.fillStyle = shirt;
+  roundRect(ctx, -5.5, -11 - lift * 0.4, 11, 8, 3); ctx.fill();
+  return lift;
+}
+function drawPlayerS() {
+  drawShadowS(6);
+  const lift = drawBodyS(player.facing, player.step, player.moving, '#e2574c');
+  const hy = -16 - lift;
+  ctx.fillStyle = '#f5cf9e';
+  ctx.beginPath(); ctx.arc(0, hy, 6.4, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#5d4030';
+  ctx.beginPath(); ctx.arc(0, hy - 1.4, 6.4, Math.PI, TAU); ctx.fill();
+  ctx.fillRect(-6.4, hy - 2.5, 12.8, 2.2);
+  const blink = Math.sin(gameTime() * 0.7 + 1) > 0.985;
+  drawEyesS(hy + 1.5, player.facing, blink);
+  if (Date.now() < player.coffeeUntil) { // coffee sparkle
+    ctx.fillStyle = 'rgba(255,235,140,' + (0.4 + 0.3 * Math.sin(gameTime() * 6)) + ')';
+    ctx.beginPath(); ctx.arc(7, hy - 6, 1.4, 0, TAU); ctx.fill();
+  }
+}
+function drawNPCS(n) {
+  const moving = n.state === 'walk';
+  drawShadowS(6);
+  const lift = drawBodyS(n.facing, n.step, moving, n.def.shirt);
+  const hy = -16 - lift;
+  const body = n.def.body, accent = n.def.accent;
+  ctx.fillStyle = body;
+  ctx.beginPath(); ctx.arc(0, hy, 6.6, 0, TAU); ctx.fill();
+  const kind = n.def.kind;
+  if (kind === 'cat' || kind === 'wolf') {
+    const earH = kind === 'wolf' ? 11 : 9.5;
+    ctx.beginPath();
+    ctx.moveTo(-6, hy - 3); ctx.lineTo(-5.4, hy - earH); ctx.lineTo(-1.4, hy - 5.6); ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(6, hy - 3); ctx.lineTo(5.4, hy - earH); ctx.lineTo(1.4, hy - 5.6); ctx.closePath(); ctx.fill();
+    if (kind === 'wolf') { // muzzle
+      ctx.fillStyle = '#e9edf4';
+      ctx.beginPath(); ctx.ellipse(0, hy + 3, 3.4, 2.4, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#2b2018';
+      ctx.beginPath(); ctx.arc(0, hy + 2.2, 1, 0, TAU); ctx.fill();
+    } else {
+      ctx.strokeStyle = accent; ctx.lineWidth = 0.6;
+      ctx.beginPath();
+      ctx.moveTo(-6, hy + 1.5); ctx.lineTo(-9.5, hy + 1);
+      ctx.moveTo(-6, hy + 3); ctx.lineTo(-9.5, hy + 3.5);
+      ctx.moveTo(6, hy + 1.5); ctx.lineTo(9.5, hy + 1);
+      ctx.moveTo(6, hy + 3); ctx.lineTo(9.5, hy + 3.5);
+      ctx.stroke();
+    }
+    const blink = Math.sin(gameTime() * 0.8 + n.x) > 0.98;
+    drawEyesS(hy + 0.5, n.facing, blink);
+  } else if (kind === 'frog') {
+    ctx.beginPath(); ctx.arc(-3.6, hy - 5.4, 2.8, 0, TAU); ctx.arc(3.6, hy - 5.4, 2.8, 0, TAU); ctx.fill();
+    if (n.facing !== 'up') {
+      const [ox] = faceOffset(n.facing);
+      ctx.fillStyle = '#2b2018';
+      ctx.fillRect(-4.4 + ox, hy - 6.2, 1.8, 2.2);
+      ctx.fillRect(2.6 + ox, hy - 6.2, 1.8, 2.2);
+    }
+    ctx.strokeStyle = accent; ctx.lineWidth = 0.8;
+    ctx.beginPath(); ctx.arc(0, hy + 2.4, 2.4, 0.2, Math.PI - 0.2); ctx.stroke();
+  } else if (kind === 'penguin') {
+    ctx.fillStyle = '#f3f6fa';
+    ctx.beginPath(); ctx.ellipse(0, hy + 1, 4.4, 4.2, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = accent;
+    ctx.beginPath(); ctx.moveTo(-2, hy + 1.5); ctx.lineTo(2, hy + 1.5); ctx.lineTo(0, hy + 4.4); ctx.closePath(); ctx.fill();
+    const blink = Math.sin(gameTime() * 0.8 + n.x) > 0.98;
+    drawEyesS(hy - 0.5, n.facing, blink);
+  }
+}
+function drawNookStandingS() {
+  drawShadowS(7);
+  ctx.save();
+  ctx.scale(0.62, 0.62);
+  ctx.translate(0, -33);
+  drawNook(ctx, 0, 0, 1, false);
+  ctx.restore();
+}
+function drawNook(c, x, y, s, talking) {
+  const t = gameTime();
+  c.save(); c.translate(x, y); c.scale(s, s);
+  c.fillStyle = '#8a6644';
+  roundRect(c, -16, 6, 32, 26, 9); c.fill();
+  c.fillStyle = '#4d8f5c';
+  roundRect(c, -12, 12, 24, 20, 6); c.fill();
+  c.fillStyle = '#bfe3a8';
+  c.beginPath(); c.arc(0, 20, 4, 0, TAU); c.fill();
+  c.fillStyle = '#6e4f33';
+  c.beginPath(); c.arc(-12, -16, 5.5, 0, TAU); c.arc(12, -16, 5.5, 0, TAU); c.fill();
+  c.fillStyle = '#8a6644';
+  c.beginPath(); c.arc(0, -8, 16, 0, TAU); c.fill();
+  c.fillStyle = '#54402c';
+  c.beginPath(); c.ellipse(-6.5, -10, 6, 4.6, -0.25, 0, TAU); c.fill();
+  c.beginPath(); c.ellipse(6.5, -10, 6, 4.6, 0.25, 0, TAU); c.fill();
+  c.fillStyle = '#e8d6b8';
+  c.beginPath(); c.ellipse(0, -2.5, 8.5, 6.5, 0, 0, TAU); c.fill();
+  const blink = Math.sin(t * 0.9) > 0.97;
+  if (!blink) {
+    c.fillStyle = '#fff';
+    c.beginPath(); c.arc(-6.5, -10, 2.6, 0, TAU); c.arc(6.5, -10, 2.6, 0, TAU); c.fill();
+    c.fillStyle = '#1d160f';
+    c.beginPath(); c.arc(-6, -9.7, 1.4, 0, TAU); c.arc(7, -9.7, 1.4, 0, TAU); c.fill();
+  } else {
+    c.strokeStyle = '#1d160f'; c.lineWidth = 1.2;
+    c.beginPath(); c.moveTo(-9, -10); c.lineTo(-4, -10); c.moveTo(4, -10); c.lineTo(9, -10); c.stroke();
+  }
+  c.fillStyle = '#3a2c1d';
+  c.beginPath(); c.ellipse(0, -4.5, 2.6, 1.9, 0, 0, TAU); c.fill();
+  c.strokeStyle = '#3a2c1d'; c.lineWidth = 1.1;
+  const open = talking ? (Math.sin(t * 14) * 0.5 + 0.5) * 2.5 : 0;
+  c.beginPath(); c.arc(0, -1 + open * 0.3, 3.5 + open * 0.2, 0.25, Math.PI - 0.25); c.stroke();
+  c.restore();
+}
+
+function drawTreeS(tr) {
+  const t = gameTime();
+  const sway = Math.sin(t * 1.2 + tr.sway) * 1.2;
+  drawShadowS(11);
+  ctx.fillStyle = '#7c5a36';
+  ctx.fillRect(-2.5, -16, 5, 16);
+  if (SEASON === 'winter') {
+    ctx.strokeStyle = '#7c5a36'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, -14); ctx.lineTo(-8 + sway, -27);
+    ctx.moveTo(0, -16); ctx.lineTo(7 + sway, -29);
+    ctx.moveTo(0, -12); ctx.lineTo(3 + sway, -33);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.beginPath(); ctx.ellipse(sway, -29, 9, 4, 0, 0, TAU); ctx.fill();
+    return;
+  }
+  const canopy = SEASON === 'autumn' ? ['#c87c30', '#b96a26'] : SEASON === 'spring' ? ['#54b04a', '#479e3e'] : ['#3f9440', '#358536'];
+  ctx.fillStyle = canopy[1];
+  ctx.beginPath(); ctx.arc(sway, -26, 13, 0, TAU); ctx.fill();
+  ctx.fillStyle = canopy[0];
+  ctx.beginPath();
+  ctx.arc(-7 + sway, -22, 9, 0, TAU);
+  ctx.arc(7 + sway, -22, 9, 0, TAU);
+  ctx.arc(sway, -32, 9.5, 0, TAU);
+  ctx.fill();
+  if (SEASON === 'spring') {
+    ctx.fillStyle = '#ffc2d4';
+    for (let i = 0; i < 5; i++) {
+      const a = i * 1.3 + tr.sway;
+      ctx.beginPath(); ctx.arc(sway + Math.cos(a) * 8, -26 + Math.sin(a) * 6, 1.6, 0, TAU); ctx.fill();
+    }
+  } else {
+    ctx.fillStyle = '#ff9c4a';
+    ctx.beginPath();
+    ctx.arc(-5 + sway, -22, 2, 0, TAU);
+    ctx.arc(6 + sway, -28, 2, 0, TAU);
+    ctx.fill();
+  }
+}
+function drawRockS(r) {
+  const s = r.s;
+  drawShadowS(8 * s);
+  ctx.fillStyle = '#8d8d96';
+  ctx.beginPath();
+  ctx.moveTo(-8 * s, 0);
+  ctx.quadraticCurveTo(-8 * s, -9 * s, -2 * s, -10 * s);
+  ctx.quadraticCurveTo(7 * s, -10 * s, 8 * s, -3 * s);
+  ctx.quadraticCurveTo(8 * s, 0, 0, 1);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#a5a5ae';
+  ctx.beginPath(); ctx.ellipse(-2 * s, -6 * s, 4 * s, 2.5 * s, -0.3, 0, TAU); ctx.fill();
+}
+function drawFlowerS(c1, c2, ph) {
+  const sway = Math.sin(gameTime() * 1.6 + ph) * 0.8;
+  ctx.strokeStyle = '#3f7a3f'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(sway, -3, sway, -6); ctx.stroke();
+  ctx.fillStyle = c1;
+  for (let i = 0; i < 5; i++) {
+    const a = i / 5 * TAU + ph;
+    ctx.beginPath(); ctx.arc(sway + Math.cos(a) * 2.4, -7 + Math.sin(a) * 2.4, 1.8, 0, TAU); ctx.fill();
+  }
+  ctx.fillStyle = c2;
+  ctx.beginPath(); ctx.arc(sway, -7, 1.6, 0, TAU); ctx.fill();
+}
+function drawPlantS(p) {
+  const st = plantStage(p);
+  if (st === 0) {
+    ctx.fillStyle = '#8a6644';
+    ctx.beginPath(); ctx.ellipse(0, 0, 5, 3, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#5dbb4e';
+    ctx.fillRect(-0.7, -4, 1.4, 4);
+  } else if (st === 1) {
+    ctx.strokeStyle = '#3f8a3f'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -5); ctx.stroke();
+    ctx.fillStyle = '#5dbb4e';
+    ctx.beginPath(); ctx.ellipse(-2.4, -5, 2.6, 1.4, -0.5, 0, TAU); ctx.ellipse(2.4, -5, 2.6, 1.4, 0.5, 0, TAU); ctx.fill();
+  } else if (st === 2) {
+    ctx.strokeStyle = '#3f8a3f'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -8); ctx.stroke();
+    ctx.fillStyle = '#88c860';
+    ctx.beginPath(); ctx.arc(0, -9, 2.6, 0, TAU); ctx.fill();
+  } else {
+    drawFlowerS('#ff6f87', '#ffe27a', p.t0 % 7);
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.4 + 0.3 * Math.sin(gameTime() * 3)) + ')';
+    ctx.beginPath(); ctx.arc(5, -11, 1, 0, TAU); ctx.fill();
+  }
+}
+
+// ----- buildings (origin at door base center) -----
+function drawWindows(x0, y0, glow) {
+  ctx.fillStyle = glow ? '#ffe9a3' : '#bfe2ef';
+  roundRect(ctx, x0, y0, 13, 12, 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(90,60,30,0.5)'; ctx.lineWidth = 1;
+  roundRect(ctx, x0, y0, 13, 12, 2); ctx.stroke();
+}
+function drawDoor(w) {
+  ctx.fillStyle = '#7c5a36';
+  roundRect(ctx, -w / 2, -24, w, 28, 4); ctx.fill();
+  ctx.fillStyle = '#5e4226';
+  ctx.fillRect(-1, -24, 2, 28);
+}
+function drawSign(text, y) {
+  const w = Math.max(50, text.length * 5.2 + 14);
+  ctx.fillStyle = '#fff6dd';
+  roundRect(ctx, -w / 2, y, w, 10, 4); ctx.fill();
+  ctx.fillStyle = '#7a5230';
+  ctx.font = "800 7px Nunito, sans-serif";
+  ctx.textAlign = 'center';
+  ctx.fillText(text, 0, y + 7.5);
+}
+function drawBuildingS(key) {
+  const glow = dayPeriod() === 'night' || dayPeriod() === 'evening';
+  const d = BD[key];
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.beginPath(); ctx.ellipse(0, 4, d.w * 0.55, 7, 0, 0, TAU); ctx.fill();
+  if (key === 'tent') {
+    ctx.fillStyle = '#4d8f5c';
+    ctx.beginPath();
+    ctx.moveTo(-23, 2); ctx.lineTo(0, -36); ctx.lineTo(23, 2);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#3f7a4c';
+    ctx.beginPath();
+    ctx.moveTo(-9, 2); ctx.lineTo(0, -22); ctx.lineTo(9, 2);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#8a6644'; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(0, -36); ctx.lineTo(0, -42); ctx.stroke();
+    ctx.fillStyle = '#ffd95e';
+    ctx.beginPath(); ctx.moveTo(0, -42); ctx.lineTo(8, -39.5); ctx.lineTo(0, -37); ctx.closePath(); ctx.fill();
+    drawSign(T('b_tent'), 6);
+    return;
+  }
+  const wallCol = { house: '#f0d8a8', shop: '#e8c98c', museum: '#e3d6bd', cafe: '#dcb88f', home1: '#cfe3f0', home2: '#e7d6ef' }[key];
+  const roofCol = { house: '#d96f4e', shop: '#4d8f5c', museum: '#7a6a52', cafe: '#a0563c', home1: '#5f8fc0', home2: '#9a6fc0' }[key];
+  // walls
+  ctx.fillStyle = wallCol;
+  ctx.fillRect(-d.w / 2, -d.h + 18, d.w, d.h - 14);
+  ctx.fillStyle = 'rgba(0,0,0,0.08)';
+  ctx.fillRect(-d.w / 2, -d.h + 18, d.w, 4);
+  // roof
+  ctx.fillStyle = roofCol;
+  ctx.beginPath();
+  ctx.moveTo(-d.w / 2 - 7, -d.h + 20);
+  ctx.lineTo(0, -d.h - 8);
+  ctx.lineTo(d.w / 2 + 7, -d.h + 20);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.fillRect(-d.w / 2 - 7, -d.h + 18, d.w + 14, 4);
+  if (key === 'museum') { // columns + wide steps
+    ctx.fillStyle = '#f2ead8';
+    for (const cxp of [-d.w / 2 + 10, -d.w / 2 + 26, d.w / 2 - 26, d.w / 2 - 10]) {
+      ctx.fillRect(cxp - 3, -d.h + 22, 6, d.h - 20);
+    }
+    ctx.fillStyle = '#cdbfa4';
+    ctx.fillRect(-d.w / 2, 0, d.w, 4);
+  }
+  if (key === 'cafe') { // awning
+    ctx.fillStyle = '#fff';
+    for (let i = 0; i < 6; i++) {
+      ctx.fillStyle = i % 2 ? '#fff' : '#d96f4e';
+      ctx.fillRect(-d.w / 2 + 6 + i * (d.w - 12) / 6, -d.h + 24, (d.w - 12) / 6, 8);
+    }
+    // steaming cup sign
+    ctx.fillStyle = '#fff6dd';
+    ctx.beginPath(); ctx.arc(d.w / 2 - 10, -d.h + 6, 6, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#6b4a2a';
+    ctx.font = '800 8px Nunito, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('☕', d.w / 2 - 10, -d.h + 9);
+  }
+  drawDoor(key === 'museum' ? 20 : 18);
+  if (key !== 'house') {
+    drawWindows(-d.w / 2 + 8, -d.h + 30, glow);
+    drawWindows(d.w / 2 - 21, -d.h + 30, glow);
+  } else {
+    drawWindows(-d.w / 2 + 9, -d.h + 30, glow);
+    ctx.fillStyle = '#b98d52'; // mailbox
+    ctx.fillRect(d.w / 2 - 12, -10, 2.4, 10);
+    ctx.fillStyle = '#e2574c';
+    roundRect(ctx, d.w / 2 - 16, -16, 11, 7, 3); ctx.fill();
+  }
+  drawSign(T('b_' + key), -d.h + 4);
+}
+function drawLampS() {
+  drawShadowS(4);
+  ctx.fillStyle = '#46535e';
+  ctx.fillRect(-1.2, -22, 2.4, 22);
+  ctx.beginPath(); ctx.arc(0, -24, 4, 0, TAU); ctx.fill();
+  const night = dayPeriod() === 'night' || dayPeriod() === 'evening';
+  ctx.fillStyle = night ? '#ffe9a3' : '#cfd8dd';
+  ctx.beginPath(); ctx.arc(0, -24, 2.6, 0, TAU); ctx.fill();
+  if (night) {
+    const g = ctx.createRadialGradient(0, -24, 2, 0, -24, 34);
+    g.addColorStop(0, 'rgba(255,225,150,0.30)');
+    g.addColorStop(1, 'rgba(255,225,150,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, -24, 34, 0, TAU); ctx.fill();
+  }
+}
+
+// ----- icons -----
+function drawIcon(type, x, y, s) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  if (type === 'shell') {
+    ctx.fillStyle = '#f1b8c4';
+    ctx.beginPath(); ctx.moveTo(0, 4); ctx.arc(0, 0, 5, Math.PI * 0.15, Math.PI * 0.85, true); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#d98da0'; ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(0, 4); ctx.lineTo(-3, -3); ctx.moveTo(0, 4); ctx.lineTo(0, -4.6); ctx.moveTo(0, 4); ctx.lineTo(3, -3);
+    ctx.stroke();
+  } else if (type === 'fruit') {
+    ctx.fillStyle = '#ffab66';
+    ctx.beginPath(); ctx.arc(0, 0.5, 4.6, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#ff8a4d';
+    ctx.beginPath(); ctx.arc(1.4, 1.4, 3, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#4d8f3c';
+    ctx.beginPath(); ctx.ellipse(1.4, -4.4, 2.4, 1.2, 0.6, 0, TAU); ctx.fill();
+  } else if (type === 'fish') {
+    ctx.fillStyle = '#6db3d8';
+    ctx.beginPath(); ctx.ellipse(-0.5, 0, 4.6, 2.8, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(3.4, 0); ctx.lineTo(6.4, -2.6); ctx.lineTo(6.4, 2.6); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#173b4f';
+    ctx.beginPath(); ctx.arc(-2.6, -0.6, 0.8, 0, TAU); ctx.fill();
+  } else if (type === 'fossil') {
+    ctx.strokeStyle = '#9a7d5a'; ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    for (let a = 0; a < TAU * 2.1; a += 0.3) {
+      const r = 0.9 + a * 0.75;
+      const px = Math.cos(a) * r, py = Math.sin(a) * r;
+      a === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  } else if (type === 'flower') {
+    ctx.fillStyle = '#ff6f87';
+    for (let i = 0; i < 5; i++) {
+      const a = i / 5 * TAU;
+      ctx.beginPath(); ctx.arc(Math.cos(a) * 3, Math.sin(a) * 3, 2.4, 0, TAU); ctx.fill();
+    }
+    ctx.fillStyle = '#ffe27a';
+    ctx.beginPath(); ctx.arc(0, 0, 2, 0, TAU); ctx.fill();
+  } else if (type === 'seeds') {
+    ctx.fillStyle = '#d8b27a';
+    roundRect(ctx, -4, -3, 8, 8, 2); ctx.fill();
+    ctx.fillStyle = '#b58e58';
+    ctx.fillRect(-4, -3, 8, 2.4);
+    ctx.fillStyle = '#6b4f2f';
+    ctx.beginPath(); ctx.arc(-1.4, 1.6, 0.9, 0, TAU); ctx.arc(1.6, 2.6, 0.9, 0, TAU); ctx.arc(0.6, 0, 0.9, 0, TAU); ctx.fill();
+  } else if (type === 'rod') {
+    ctx.strokeStyle = '#8a6644'; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(-4.5, 4.5); ctx.lineTo(4, -4); ctx.stroke();
+    ctx.strokeStyle = '#9db4c0'; ctx.lineWidth = 0.8;
+    ctx.beginPath(); ctx.moveTo(4, -4); ctx.quadraticCurveTo(5.5, 0, 3.5, 2.5); ctx.stroke();
+    ctx.fillStyle = '#e2574c';
+    ctx.beginPath(); ctx.arc(3.5, 3, 1.4, 0, TAU); ctx.fill();
+  } else if (type === 'shovel') {
+    ctx.strokeStyle = '#8a6644'; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(0, -5); ctx.lineTo(0, 1.5); ctx.stroke();
+    ctx.strokeStyle = '#8a6644'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(-2, -5); ctx.lineTo(2, -5); ctx.stroke();
+    ctx.fillStyle = '#9aa3ad';
+    ctx.beginPath(); ctx.moveTo(-2.6, 1.5); ctx.lineTo(2.6, 1.5); ctx.lineTo(1.8, 5.5); ctx.lineTo(-1.8, 5.5); ctx.closePath(); ctx.fill();
+  } else if (type === 'coffee') {
+    ctx.fillStyle = '#fff';
+    roundRect(ctx, -3.5, -2, 7, 6, 2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(4, 0.5, 1.8, -1, 1.6); ctx.stroke();
+    ctx.fillStyle = '#6b4a2a';
+    ctx.beginPath(); ctx.ellipse(0, -1.6, 3, 1, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = 'rgba(160,160,160,0.9)'; ctx.lineWidth = 0.7;
+    ctx.beginPath(); ctx.moveTo(-1, -3.5); ctx.quadraticCurveTo(-2, -5, -1, -6.5); ctx.moveTo(1.4, -3.5); ctx.quadraticCurveTo(0.4, -5, 1.4, -6.5); ctx.stroke();
+  } else if (type === 'bell') {
+    ctx.fillStyle = '#ffd95e';
+    ctx.beginPath(); ctx.arc(0, 0, 4.6, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#c79a2a'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(0, 0, 4.6, 0, TAU); ctx.stroke();
+    ctx.fillStyle = '#c79a2a';
+    ctx.font = '800 6px Nunito, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('★', 0, 2.2);
+  }
+  ctx.restore();
+}
+
+/* ----- world render (rolling-log pseudo-3D) ----- */
+function renderWorld() {
+  refreshProj();
+  const z = view.zoom * view.dpr;
+  ctx.setTransform(z, 0, 0, z, 0, 0);
+  const t = gameTime();
+  const SW = proj.SW, SH = proj.SH, R = proj.R;
+  const horizonY = proj.horizonY;
+  const period = dayPeriod();
+
+  // --- sky band ---
+  const [top, bottom] = skyColors();
+  let g = ctx.createLinearGradient(0, 0, 0, horizonY + 8);
+  g.addColorStop(0, top); g.addColorStop(1, bottom);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, SW, horizonY + 2);
+  // sun / moon / stars
+  const h = nowHour();
+  const isDay = h >= 6 && h < 19;
+  const progT = isDay ? (h - 6) / 13 : ((h >= 19 ? h - 19 : h + 5) / 11);
+  const ax = lerp(SW * 0.12, SW * 0.88, progT);
+  const ay = horizonY - 6 - Math.sin(progT * Math.PI) * horizonY * 0.65;
+  if (isDay) {
+    ctx.fillStyle = 'rgba(255,243,184,0.35)';
+    ctx.beginPath(); ctx.arc(ax, ay, 14, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#fff3b8';
+    ctx.beginPath(); ctx.arc(ax, ay, 9, 0, TAU); ctx.fill();
+  } else {
+    ctx.fillStyle = '#f2f4e9';
+    ctx.beginPath(); ctx.arc(ax, ay, 8, 0, TAU); ctx.fill();
+    ctx.fillStyle = top;
+    ctx.beginPath(); ctx.arc(ax - 3, ay - 2, 6.6, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    for (let i = 0; i < 26; i++) {
+      const sx = hash2(i, 7) * SW, sy = hash2(i, 13) * horizonY * 0.9;
+      ctx.globalAlpha = 0.3 + (Math.sin(t * 2 + i) * 0.5 + 0.5) * 0.5;
+      ctx.fillRect(sx, sy, 1.4, 1.4);
+    }
+    ctx.globalAlpha = 1;
+  }
+  // clouds in the sky band
+  const night = period === 'night';
+  for (const c of clouds) {
+    const sx = ((c.x - cam.x * 0.25) % (SW + 200)) - 100;
+    const sy = 4 + c.y * (horizonY - 14);
+    ctx.fillStyle = night ? 'rgba(190,200,235,0.13)' : 'rgba(255,255,255,0.5)';
+    ctx.beginPath();
+    ctx.ellipse(sx, sy, 24 * c.s, 7 * c.s, 0, 0, TAU);
+    ctx.ellipse(sx + 15 * c.s, sy + 3 * c.s, 16 * c.s, 5.5 * c.s, 0, 0, TAU);
+    ctx.ellipse(sx - 16 * c.s, sy + 3 * c.s, 14 * c.s, 5 * c.s, 0, 0, TAU);
+    ctx.fill();
+  }
+
+  // --- ocean (below horizon) ---
+  const waterNear = { morning: '#4aa6d8', afternoon: '#3f9bd0', evening: '#3f7fb8', night: '#1d3a66' }[period];
+  const waterFar = { morning: '#7cc4e8', afternoon: '#6fbce2', evening: '#d99a6e', night: '#11254a' }[period];
+  g = ctx.createLinearGradient(0, horizonY, 0, SH);
+  g.addColorStop(0, waterFar); g.addColorStop(0.5, waterNear); g.addColorStop(1, waterNear);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, horizonY, SW, SH - horizonY + 1);
+
+  // --- terrain strips (perspective rows) ---
+  const y0 = Math.max(0, Math.ceil(horizonY));
+  for (let sy = y0; sy < SH; sy++) {
+    const s = SH - sy - 0.5;
+    const ratio = clamp(s / R, 0, 0.999);
+    const b = R * Math.asin(ratio);
+    const c = Math.sqrt(1 - ratio * ratio);
+    const wy = cam.by - b;
+    if (wy < 0 || wy >= WORLD_H) continue;
+    const halfW = SW / (2 * c);
+    const dx = (halfW - cam.x) * c;
+    ctx.drawImage(terrainCv, 0, Math.floor(wy), WORLD_W, 1, dx, sy, WORLD_W * c, 1.1);
+  }
+
+  // --- water sparkles (projected) ---
+  ctx.fillStyle = period === 'night' ? 'rgba(190,210,255,0.25)' : 'rgba(255,255,255,0.4)';
+  const ty0 = Math.max(0, Math.floor((cam.by - R * 1.4) / TILE));
+  const ty1 = Math.min(MH - 1, Math.ceil(cam.by / TILE));
+  const tx0 = Math.max(0, Math.floor((cam.x - SW) / TILE));
+  const tx1 = Math.min(MW - 1, Math.ceil((cam.x + SW) / TILE));
+  for (let y = ty0; y <= ty1; y++) for (let x = tx0; x <= tx1; x++) {
+    if (map[y][x] !== T_WATER) continue;
+    const hh = hash2(x, y);
+    if (hh < 0.10) {
+      const ph = Math.sin(t * 1.5 + hh * 60);
+      if (ph > 0.2) {
+        const p = project(x * TILE + hh * 700 % 12, y * TILE + hh * 300 % 12);
+        if (p.vis && p.x > -8 && p.x < SW + 8) ctx.fillRect(p.x, p.y, 3.5 * ph * p.c, Math.max(0.6, p.c));
+      }
+    }
+  }
+
+  // --- shoreline foam (projected lines) ---
+  ctx.lineCap = 'round';
+  for (const e of foamEdges) {
+    const ex = e.x * TILE, ey = e.y * TILE;
+    if (ey > cam.by + 24 || ey < cam.by - R * 1.4) continue;
+    if (Math.abs(ex - cam.x) > SW) continue;
+    const pulse = Math.sin(t * 1.7 + e.ph);
+    const off = 2 + pulse * 1.6;
+    let x1, y1, x2, y2;
+    if (e.side === 0) { x1 = ex + 2; y1 = ey - off; x2 = ex + TILE - 2; y2 = y1; }
+    else if (e.side === 1) { x1 = ex + TILE + off; y1 = ey + 2; x2 = x1; y2 = ey + TILE - 2; }
+    else if (e.side === 2) { x1 = ex + 2; y1 = ey + TILE + off; x2 = ex + TILE - 2; y2 = y1; }
+    else { x1 = ex - off; y1 = ey + 2; x2 = x1; y2 = ey + TILE - 2; }
+    const p1 = project(x1, y1), p2 = project(x2, y2);
+    if (!p1.vis || !p2.vis) continue;
+    ctx.strokeStyle = `rgba(255,255,255,${(0.3 + pulse * 0.2) * p1.c})`;
+    ctx.lineWidth = 1.4 * p1.c;
+    ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+  }
+
+  // --- flat ground layer (flowers, items, plants) ---
+  const drawAt = (wx, wy, fn, arg) => {
+    const p = project(wx, wy);
+    if (!p.vis || p.x < -60 || p.x > SW + 60) return false;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.scale(p.c, p.c);
+    fn(arg);
+    ctx.restore();
+    return true;
+  };
+  for (const f of wildflowers) drawAt(f.x, f.y, () => drawFlowerS(f.c1, f.c2, f.ph));
+  for (const it of groundItems) {
+    if (it.type === 'fish') {
+      const p = project(it.x, it.y);
+      if (!p.vis) continue;
+      ctx.fillStyle = 'rgba(10,40,60,0.35)';
+      const wob = Math.sin(t * 3 + it.ph) * 1.4;
+      ctx.beginPath(); ctx.ellipse(p.x, p.y, (6 + wob * 0.4) * p.c, 3.4 * p.c, Math.sin(it.ph + t * 0.5) * 0.4, 0, TAU); ctx.fill();
+      const rip = (t * 0.7 + it.ph) % 1;
+      ctx.strokeStyle = `rgba(255,255,255,${0.35 * (1 - rip) * p.c})`;
+      ctx.lineWidth = 0.8 * p.c;
+      ctx.beginPath(); ctx.arc(p.x, p.y, (5 + rip * 9) * p.c, 0, TAU); ctx.stroke();
+    } else if (it.type === 'fossil') {
+      drawAt(it.x, it.y, () => {
+        ctx.strokeStyle = 'rgba(110,80,40,0.8)'; ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        for (let i = 0; i < 4; i++) {
+          const a = i / 4 * TAU + 0.6;
+          ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * 5, Math.sin(a) * 5);
+        }
+        ctx.stroke();
+        ctx.fillStyle = 'rgba(110,80,40,0.45)';
+        ctx.beginPath(); ctx.arc(0, 0, 2.2, 0, TAU); ctx.fill();
+      });
+    } else {
+      drawAt(it.x, it.y, () => {
+        const bob = Math.sin(t * 2.4 + it.ph) * 1.2;
+        ctx.fillStyle = 'rgba(0,0,0,0.13)';
+        ctx.beginPath(); ctx.ellipse(0, 3, 4, 1.6, 0, 0, TAU); ctx.fill();
+        drawIcon(it.type, 0, -2 - bob, 0.9);
+      });
+    }
+  }
+  for (const p of plants) drawAt(p.x, p.y, () => drawPlantS(p));
+
+  // --- depth-sorted standing sprites ---
+  const drawables = [];
+  for (const b of activeBuildings()) drawables.push({ y: b.y, fn: () => drawBuildingS(b.key), x: b.x });
+  drawables.push({ y: plots.tent.y + 8, x: plots.tent.x + 28, fn: drawNookStandingS });
+  if (prog && prog.built.shop) drawables.push({ y: plots.shop.y + 28, x: plots.shop.x - 52, fn: drawLampS });
+  for (const tr of trees) drawables.push({ y: tr.y, x: tr.x, fn: () => drawTreeS(tr) });
+  for (const r of rocks) drawables.push({ y: r.y, x: r.x, fn: () => drawRockS(r) });
+  for (const n of npcs) drawables.push({ y: n.y, x: n.x, fn: () => drawNPCS(n) });
+  drawables.push({ y: player.y, x: player.x, fn: drawPlayerS });
+  drawables.sort((a, b) => a.y - b.y);
+  for (const d of drawables) drawAt(d.x, d.y, d.fn);
+
+  // --- interact bubble ---
+  const tgt = !dlg.open && !ui.mode ? nearestInteract() : null;
+  if (tgt) {
+    let bx = player.x, by = player.y - 36;
+    if (tgt.obj) { bx = tgt.obj.x; by = tgt.obj.y - (tgt.kind === 'npc' ? 34 : 18); }
+    else if (tgt.kind === 'nook') { bx = plots.tent.x + 28; by = plots.tent.y - 34; }
+    else if (plots[tgt.kind]) { bx = plots[tgt.kind].x; by = plots[tgt.kind].y - BD[tgt.kind].h - 14; }
+    const p = project(bx, by);
+    if (p.vis) {
+      const bob = Math.sin(t * 4) * 1.5;
+      ctx.fillStyle = 'rgba(255,251,233,0.95)';
+      roundRect(ctx, p.x - 6, p.y - 6 + bob, 12, 12, 4); ctx.fill();
+      ctx.fillStyle = '#7a5230';
+      ctx.font = '900 8px Nunito, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('E', p.x, p.y + 3 + bob);
+    }
+  }
+}
+
+function renderParticles() {
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  for (const p of particles) {
+    if (p.kind === 'snow') {
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.beginPath(); ctx.arc(p.x, p.y, 1.6 + Math.sin(p.ph) * 0.5, 0, TAU); ctx.fill();
+    } else if (p.kind === 'leaf') {
+      ctx.fillStyle = p.c;
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(Math.sin(p.ph) * 1.2);
+      ctx.beginPath(); ctx.ellipse(0, 0, 3.4, 1.8, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    } else if (p.kind === 'petal') {
+      ctx.fillStyle = 'rgba(255,190,210,0.9)';
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(Math.sin(p.ph) * 0.9);
+      ctx.beginPath(); ctx.ellipse(0, 0, 2.6, 1.5, 0, 0, TAU); ctx.fill();
+      ctx.restore();
+    } else {
+      const a = 0.25 + 0.25 * Math.sin(p.ph * 2);
+      ctx.fillStyle = dayPeriod() === 'night' ? `rgba(255,250,170,${a})` : `rgba(255,255,255,${a * 0.7})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 1.3, 0, TAU); ctx.fill();
+    }
+  }
+}
+function renderLightAndVignette() {
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  const [r, g, b, a] = lightTint();
+  if (a > 0.004) {
+    ctx.fillStyle = `rgba(${r | 0},${g | 0},${b | 0},${a})`;
+    ctx.fillRect(0, 0, view.w, view.h);
+  }
+  if (vignetteCv) ctx.drawImage(vignetteCv, 0, 0, view.w, view.h);
+}
+
+// ----- UI helpers -----
+function panel(x, y, w, h, alpha = 0.93) {
+  ctx.save();
+  ctx.shadowColor = 'rgba(60,40,10,0.25)';
+  ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+  ctx.fillStyle = `rgba(255,250,231,${alpha})`;
+  roundRect(ctx, x, y, w, h, 14); ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(185,141,82,0.8)'; ctx.lineWidth = 2;
+  roundRect(ctx, x, y, w, h, 14); ctx.stroke();
+}
+function fmtTime(d = new Date()) {
+  let h = d.getHours();
+  const ap = h < 12 ? 'AM' : 'PM';
+  h = (h + 11) % 12 + 1;
+  return `${h}:${String(d.getMinutes()).padStart(2, '0')} ${ap}`;
+}
+const DAYS_EN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const DAYS_ES = ['dom', 'lun', 'mar', 'mié', 'jue', 'vie', 'sáb'];
+const MON_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const MON_ES = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+function fmtDate(d = new Date()) {
+  return lang === 'es'
+    ? `${DAYS_ES[d.getDay()]}, ${d.getDate()} ${MON_ES[d.getMonth()]}`
+    : `${DAYS_EN[d.getDay()]}, ${MON_EN[d.getMonth()]} ${d.getDate()}`;
+}
+function wrapText(text, x, y, maxW, lh) {
+  const words = text.split(' ');
+  let line = '', yy = y;
+  for (const word of words) {
+    const test = line ? line + ' ' + word : word;
+    if (ctx.measureText(test).width > maxW && line) {
+      ctx.fillText(line, x, yy); line = word; yy += lh;
+    } else line = test;
+  }
+  ctx.fillText(line, x, yy);
+}
+
+function renderHUD() {
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  ctx.textBaseline = 'alphabetic';
+  const d = new Date();
+
+  panel(14, 14, 168, 54);
+  ctx.fillStyle = '#7a5230';
+  ctx.font = '900 22px Nunito, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(fmtTime(d), 28, 40);
+  ctx.font = '700 12px Nunito, sans-serif';
+  ctx.fillStyle = '#a3845c';
+  const days = prog ? Math.floor((Date.now() - prog.createdAt) / 86400e3) + 1 : 1;
+  ctx.fillText(`${fmtDate(d)}  ·  ${T('slot_day', { n: days })}`, 28, 58);
+
+  const bw = 132;
+  panel(view.w - bw - 14, 14, bw, 40);
+  drawIcon('bell', view.w - bw + 8, 34, 1.6);
+  ctx.fillStyle = '#7a5230';
+  ctx.font = '900 17px Nunito, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(String(player.bells), view.w - bw + 24, 40);
+  // coffee buff
+  if (Date.now() < player.coffeeUntil) {
+    const left = Math.ceil((player.coffeeUntil - Date.now()) / 1000);
+    panel(view.w - bw - 14, 60, bw, 30, 0.85);
+    drawIcon('coffee', view.w - bw + 4, 75, 1.2);
+    ctx.fillStyle = '#7a5230';
+    ctx.font = '800 13px Nunito, sans-serif';
+    ctx.fillText(`${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`, view.w - bw + 22, 80);
+  }
+
+  // objective
+  const obj = currentObjective();
+  if (obj) {
+    ctx.font = '800 13px Nunito, sans-serif';
+    const w = ctx.measureText(obj).width + 36;
+    panel(view.w / 2 - w / 2, 14, w, 30, 0.85);
+    ctx.fillStyle = '#4d8f5c';
+    ctx.textAlign = 'center';
+    ctx.fillText(obj, view.w / 2, 34);
+  }
+
+  ctx.font = '700 11px Nunito, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255,250,231,0.75)';
+  ctx.fillText(T('controls'), 16, view.h - 12);
+
+  if (minimapOn) renderMinimap();
+
+  ctx.textAlign = 'center';
+  toasts.forEach((tt, i) => {
+    const a = tt.t < 0.2 ? tt.t / 0.2 : tt.t > 2.3 ? Math.max(0, 1 - (tt.t - 2.3) / 0.5) : 1;
+    const y = 56 + i * 34 - (tt.t < 0.2 ? (0.2 - tt.t) * 30 : 0);
+    ctx.font = '800 14px Nunito, sans-serif';
+    const w = ctx.measureText(tt.text).width + 34;
+    ctx.globalAlpha = a;
+    panel(view.w / 2 - w / 2, y, w, 28, 0.92);
+    ctx.fillStyle = '#7a5230';
+    ctx.fillText(tt.text, view.w / 2, y + 19);
+    ctx.globalAlpha = 1;
+  });
+
+  if (ui.mode === 'inv') renderInventory();
+  if (ui.mode === 'nook') renderNookMenu();
+  if (ui.mode === 'shop') renderShopMenu();
+  if (ui.mode === 'museum') renderMuseumMenu();
+  if (ui.mode === 'cafe') renderCafeMenu();
+  if (ui.mode === 'pause') renderPauseMenu();
+  if (dlg.open) renderDialog();
+}
+
+function renderMinimap() {
+  const mw = 150, mh = Math.round(mw * MH / MW);
+  const x = view.w - mw - 16, y = view.h - mh - 16;
+  ctx.save();
+  ctx.globalAlpha = 0.88;
+  ctx.fillStyle = '#2f7cb0';
+  roundRect(ctx, x - 4, y - 4, mw + 8, mh + 8, 10); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,250,231,0.9)'; ctx.lineWidth = 2;
+  roundRect(ctx, x - 4, y - 4, mw + 8, mh + 8, 10); ctx.stroke();
+  ctx.drawImage(terrainCv, x, y, mw, mh);
+  const px = x + player.x / WORLD_W * mw, py = y + player.y / WORLD_H * mh;
+  for (const b of activeBuildings()) {
+    ctx.fillStyle = b.key === 'tent' ? '#3f7a4c' : '#7a5230';
+    ctx.fillRect(x + b.x / WORLD_W * mw - 2, y + b.y / WORLD_H * mh - 2, 4, 4);
+  }
+  for (const n of npcs) {
+    ctx.fillStyle = n.def.shirt;
+    ctx.beginPath(); ctx.arc(x + n.x / WORLD_W * mw, y + n.y / WORLD_H * mh, 1.6, 0, TAU); ctx.fill();
+  }
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(px, py, 2.6, 0, TAU); ctx.fill();
+  ctx.strokeStyle = '#e2574c'; ctx.lineWidth = 1.4;
+  ctx.beginPath(); ctx.arc(px, py, 4, 0, TAU); ctx.stroke();
+  ctx.restore();
+}
+
+function renderInventory() {
+  const w = Math.min(430, view.w - 40), rowH = 54;
+  const h = 96 + Math.ceil(INV_ORDER.length / 3) * rowH;
+  const x = (view.w - w) / 2, y = (view.h - h) / 2 - 20;
+  panel(x, y, w, h);
+  ctx.fillStyle = '#7a5230';
+  ctx.font = '900 18px Nunito, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(T('pockets', { n: player.name }), x + w / 2, y + 30);
+  const cols = 3, cw = (w - 40) / cols;
+  INV_ORDER.forEach((type, i) => {
+    const cxp = x + 20 + (i % cols) * cw, cyp = y + 46 + Math.floor(i / cols) * rowH;
+    ctx.fillStyle = 'rgba(122,82,48,0.07)';
+    roundRect(ctx, cxp, cyp, cw - 8, rowH - 8, 10); ctx.fill();
+    drawIcon(type, cxp + 20, cyp + 23, 1.9);
+    const n = player.inv[type] || 0;
+    ctx.fillStyle = n > 0 ? '#7a5230' : '#c9b48e';
+    ctx.font = '800 13px Nunito, sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText(T('i_' + type), cxp + 38, cyp + 21);
+    ctx.font = '700 12px Nunito, sans-serif';
+    ctx.fillText(`× ${n}`, cxp + 38, cyp + 38);
+  });
+  // tools row
+  const ty = y + 46 + Math.ceil(INV_ORDER.length / 3) * rowH + 6;
+  ctx.fillStyle = '#a3845c';
+  ctx.font = '800 13px Nunito, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(T('tools_label'), x + 24, ty);
+  let txp = x + 100;
+  for (const tool of ['rod', 'shovel']) {
+    ctx.globalAlpha = prog.tools[tool] ? 1 : 0.25;
+    drawIcon(tool, txp, ty - 4, 1.6);
+    ctx.globalAlpha = 1;
+    txp += 36;
+  }
+  ctx.fillStyle = '#a3845c';
+  ctx.font = '700 12px Nunito, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(T('inv_help'), x + w / 2, y + h - 12);
+}
+
+function listPanel(title, subtitle, rows, footer) {
+  const w = Math.min(460, view.w - 40);
+  const h = 130 + rows.length * 38 + 8;
+  const x = (view.w - w) / 2, y = Math.max(20, (view.h - h) / 2 - 10);
+  panel(x, y, w, h);
+  drawNook(ctx, x + 44, y + 52, 1.1, false);
+  ctx.fillStyle = '#7a5230';
+  ctx.font = '900 19px Nunito, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(title, x + 86, y + 40);
+  if (subtitle) {
+    ctx.font = '700 12px Nunito, sans-serif'; ctx.fillStyle = '#a3845c';
+    wrapText(subtitle, x + 86, y + 58, w - 110, 14);
+  }
+  const ry0 = y + 104;
+  rows.forEach((r, i) => {
+    const ry = ry0 + i * 38;
+    if (i === ui.sel) {
+      ctx.fillStyle = 'rgba(77,143,92,0.16)';
+      roundRect(ctx, x + 16, ry - 6, w - 32, 34, 9); ctx.fill();
+      ctx.fillStyle = '#4d8f5c'; ctx.font = '900 14px Nunito, sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText('▶', x + 24, ry + 16);
+    }
+    if (r.icon) drawIcon(r.icon, x + 54, ry + 11, 1.5);
+    ctx.fillStyle = r.dim ? '#c9b48e' : '#7a5230';
+    ctx.font = '800 14px Nunito, sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText(r.label, x + (r.icon ? 72 : 44), ry + 16);
+    if (r.right) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = r.dim ? '#c9b48e' : '#7a5230';
+      ctx.fillText(r.right, x + w - 28, ry + 16);
+    }
+  });
+  ctx.fillStyle = '#a3845c'; ctx.font = '700 11.5px Nunito, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(footer, x + w / 2, y + h - 14);
+  return { x, y, w, h };
+}
+
+function renderNookMenu() {
+  if (ui.sub === 'sell') {
+    const rows = sellRows().map(type => ({
+      icon: type, label: `${T('i_' + type)}  × ${player.inv[type] || 0}`,
+      right: T('price', { p: Math.round(ITEMS[type].sell * 0.8) }),
+    }));
+    if (!rows.length) rows.push({ label: T('shop_empty'), dim: true });
+    listPanel(T('b_tent'), T('sell_note_tent'), rows, T('help_shop'));
+    return;
+  }
+  if (ui.sub === 'buy') {
+    const rows = buyRows().map(type => ({
+      icon: type, label: T('i_' + type),
+      right: T('price', { p: ITEMS[type].buy }),
+    }));
+    listPanel(T('b_tent'), null, rows, T('help_menu'));
+    return;
+  }
+  if (ui.sub === 'build') {
+    const rows = PROJECTS.map((p, i) => {
+      const built = prog.built[p.key];
+      const locked = i > 0 && !prog.built[PROJECTS[i - 1].key];
+      return {
+        label: (built ? '✓ ' : locked ? '🔒 ' : '') + T('b_' + p.key),
+        right: built ? T('built_tag') : T('built_cost', { c: p.cost }),
+        dim: built || locked,
+      };
+    });
+    listPanel(T('menu_build'), null, rows, T('help_menu'));
+    return;
+  }
+  const labels = ['menu_sell', 'menu_buy', 'menu_build', 'menu_chat', 'menu_leave'];
+  listPanel('Tom Nook', '"Yes, yes!"', labels.map(l => ({ label: T(l) })), T('help_menu'));
+}
+function renderShopMenu() {
+  const selling = ui.tab === 0;
+  const rows = selling
+    ? sellRows().map(type => ({ icon: type, label: `${T('i_' + type)}  × ${player.inv[type] || 0}`, right: T('price', { p: ITEMS[type].sell }) }))
+    : buyRows().map(type => ({ icon: type, label: T('i_' + type), right: T('price', { p: ITEMS[type].buy }) }));
+  if (selling && !rows.length) rows.push({ label: T('shop_empty'), dim: true });
+  const box = listPanel(T('b_shop'), T('sell_note_shop'), rows, T('help_shop'));
+  // tabs
+  const tabs = [T('tab_sell'), T('tab_buy')];
+  tabs.forEach((tb, i) => {
+    const tx = box.x + box.w - 200 + i * 96;
+    ctx.fillStyle = ui.tab === i ? '#4d8f5c' : 'rgba(122,82,48,0.12)';
+    roundRect(ctx, tx, box.y + 18, 88, 26, 999); ctx.fill();
+    ctx.fillStyle = ui.tab === i ? '#fff' : '#7a5230';
+    ctx.font = '800 12px Nunito, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(tb, tx + 44, box.y + 35);
+  });
+}
+function renderMuseumMenu() {
+  const nDon = DONATABLE.filter(t => prog.donated[t]).length;
+  const rows = DONATABLE.map(type => ({
+    icon: type,
+    label: T('i_' + type) + (prog.donated[type] ? ' ✓' : `  (× ${player.inv[type] || 0})`),
+    right: prog.donated[type] ? '★' : `+${DONATE_GRANT}`,
+    dim: prog.donated[type],
+  }));
+  listPanel(T('museum_title'), T('museum_progress', { n: nDon }), rows, T('museum_help'));
+}
+function renderCafeMenu() {
+  listPanel(T('b_cafe'), null, [{ icon: 'coffee', label: T('cafe_offer', { c: ITEMS.coffee.buy }), right: '' }], T('cafe_help'));
+}
+function renderPauseMenu() {
+  const rows = [{ label: T('pause_continue') }, { label: T('pause_lang') }, { label: T('pause_exit') }];
+  listPanel(T('pause_title'), null, rows, T('help_menu'));
+}
+
+function renderDialog() {
+  const w = Math.min(620, view.w - 50), h = 118;
+  const x = (view.w - w) / 2, y = view.h - h - 28;
+  panel(x, y, w, h, 0.96);
+  ctx.font = '900 15px Nunito, sans-serif';
+  const tagW = Math.max(ctx.measureText(dlg.speaker).width + 44, 86);
+  ctx.fillStyle = dlg.color;
+  roundRect(ctx, x + 20, y - 16, tagW, 32, 999); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
+  ctx.fillText(dlg.speaker, x + 38, y + 5);
+  const line = dlg.lines[dlg.li].slice(0, Math.floor(dlg.shown));
+  ctx.fillStyle = '#6b4a2a';
+  ctx.font = '800 16px Nunito, sans-serif';
+  wrapText(line, x + 28, y + 38, w - 56, 23);
+  if (dlg.shown >= dlg.lines[dlg.li].length) {
+    ctx.fillStyle = dlg.color;
+    const bob = Math.sin(gameTime() * 5) * 2;
+    ctx.beginPath();
+    ctx.moveTo(x + w - 30, y + h - 20 + bob);
+    ctx.lineTo(x + w - 18, y + h - 20 + bob);
+    ctx.lineTo(x + w - 24, y + h - 12 + bob);
+    ctx.closePath(); ctx.fill();
+  }
+}
+
+// ----- title / slots / intro scenes -----
+function renderBeachScene() {
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  const [top, bottom] = skyColors();
+  const g = ctx.createLinearGradient(0, 0, 0, view.h);
+  g.addColorStop(0, top); g.addColorStop(0.62, bottom);
+  g.addColorStop(0.62, '#3f9bd0'); g.addColorStop(1, '#2f7cb0');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, view.w, view.h);
+  const t = gameTime();
+  const h = nowHour();
+  const isDay = h >= 6 && h < 19;
+  const progT = isDay ? (h - 6) / 13 : ((h >= 19 ? h - 19 : h + 5) / 11);
+  const ax = lerp(view.w * 0.12, view.w * 0.88, progT);
+  const ay = view.h * 0.5 - Math.sin(progT * Math.PI) * view.h * 0.34;
+  if (isDay) {
+    ctx.fillStyle = '#fff3b8';
+    ctx.beginPath(); ctx.arc(ax, ay, 34, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(255,243,184,0.25)';
+    ctx.beginPath(); ctx.arc(ax, ay, 52, 0, TAU); ctx.fill();
+  } else {
+    ctx.fillStyle = '#f2f4e9';
+    ctx.beginPath(); ctx.arc(ax, ay, 26, 0, TAU); ctx.fill();
+    ctx.fillStyle = top;
+    ctx.beginPath(); ctx.arc(ax - 10, ay - 6, 22, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    for (let i = 0; i < 40; i++) {
+      const sx = hash2(i, 7) * view.w, sy = hash2(i, 13) * view.h * 0.55;
+      ctx.globalAlpha = 0.3 + (Math.sin(t * 2 + i) * 0.5 + 0.5) * 0.5;
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+  for (const c of clouds) {
+    const sx = ((c.x * 3) % (view.w + 480)) - 240;
+    const sy = c.y * view.h * 0.5;
+    ctx.fillStyle = dayPeriod() === 'night' ? 'rgba(190,200,235,0.10)' : 'rgba(255,255,255,0.34)';
+    ctx.beginPath();
+    ctx.ellipse(sx, sy, 56 * c.s, 16 * c.s, 0, 0, TAU);
+    ctx.ellipse(sx + 34 * c.s, sy + 6 * c.s, 38 * c.s, 13 * c.s, 0, 0, TAU);
+    ctx.ellipse(sx - 36 * c.s, sy + 7 * c.s, 34 * c.s, 12 * c.s, 0, 0, TAU);
+    ctx.fill();
+  }
+  for (let i = 0; i < 3; i++) {
+    const wy = view.h * 0.62 + 18 + i * 26 + Math.sin(t * 1.1 + i * 2) * 4;
+    ctx.strokeStyle = `rgba(255,255,255,${0.22 - i * 0.05})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for (let xx = -20; xx <= view.w + 20; xx += 30) {
+      const yy = wy + Math.sin(xx * 0.02 + t * 1.6 + i) * 5;
+      xx === -20 ? ctx.moveTo(xx, yy) : ctx.lineTo(xx, yy);
+    }
+    ctx.stroke();
+  }
+  ctx.fillStyle = SEASON === 'winter' ? '#ded7c4' : '#ecd9a2';
+  ctx.beginPath();
+  ctx.moveTo(0, view.h);
+  ctx.quadraticCurveTo(view.w * 0.5, view.h * 0.78, view.w, view.h);
+  ctx.closePath(); ctx.fill();
+}
+function renderTitle() {
+  renderBeachScene();
+  const t = gameTime();
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  const lx = view.w / 2, ly = view.h * 0.3 + Math.sin(t * 1.3) * 5;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.font = `900 ${Math.min(76, view.w / 9)}px Nunito, sans-serif`;
+  ctx.lineWidth = 10; ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#7a5230';
+  ctx.strokeText('Animal Isle', lx, ly);
+  ctx.fillStyle = '#fff6dd';
+  ctx.fillText('Animal Isle', lx, ly);
+  ctx.fillStyle = '#4d8f5c';
+  ctx.save();
+  ctx.translate(lx + Math.min(76, view.w / 9) * 2.6, ly - 44);
+  ctx.rotate(Math.sin(t * 2) * 0.2 + 0.4);
+  ctx.beginPath(); ctx.ellipse(0, 0, 16, 10, 0, 0, TAU); ctx.fill();
+  ctx.restore();
+  ctx.font = '800 17px Nunito, sans-serif';
+  ctx.fillStyle = 'rgba(255,246,221,0.95)';
+  ctx.fillText(T('title_sub'), lx, ly + 34);
+  drawNook(ctx, lx, view.h * 0.62, 2.2, false);
+  ctx.font = '800 18px Nunito, sans-serif';
+  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(t * 3.5);
+  ctx.fillStyle = '#fff';
+  ctx.fillText(T('press_start'), lx, view.h * 0.82);
+  ctx.globalAlpha = 1;
+  ctx.font = '700 13px Nunito, sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.fillText(T('lang_hint'), lx, view.h * 0.82 + 26);
+  ctx.font = '700 12px Nunito, sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText(T('clock_note', { t: fmtTime() }), lx, view.h - 18);
+}
+function renderSlots() {
+  renderBeachScene();
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.font = '900 34px Nunito, sans-serif';
+  ctx.lineWidth = 7; ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#7a5230';
+  ctx.strokeText(T('slots_title'), view.w / 2, view.h * 0.16);
+  ctx.fillStyle = '#fff6dd';
+  ctx.fillText(T('slots_title'), view.w / 2, view.h * 0.16);
+  const w = Math.min(440, view.w - 60), h = 84, gap = 18;
+  const x = (view.w - w) / 2;
+  let y = view.h * 0.22;
+  for (let i = 0; i < 3; i++) {
+    const sel = slotsUI.sel === i;
+    const info = slotSummary(i);
+    panel(x, y, w, h, sel ? 0.97 : 0.78);
+    if (sel) {
+      ctx.strokeStyle = '#4d8f5c'; ctx.lineWidth = 3.5;
+      roundRect(ctx, x, y, w, h, 14); ctx.stroke();
+      ctx.fillStyle = '#4d8f5c'; ctx.font = '900 18px Nunito, sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText('▶', x - 26, y + h / 2 + 6);
+    }
+    if (info) {
+      ctx.fillStyle = '#7a5230';
+      ctx.font = '900 19px Nunito, sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText(info.name + (info.star ? ' ★' : ''), x + 24, y + 34);
+      ctx.font = '700 13px Nunito, sans-serif'; ctx.fillStyle = '#a3845c';
+      ctx.fillText(`${T('slot_day', { n: info.days })}  ·  🔔 ${info.bells}  ·  🏠 ${info.builtCount}/${PROJECTS.length}`, x + 24, y + 56);
+      if (slotsUI.delArm === i) {
+        ctx.fillStyle = '#c0392b'; ctx.font = '800 13px Nunito, sans-serif'; ctx.textAlign = 'right';
+        ctx.fillText(T('slot_del'), x + w - 20, y + 34);
+      }
+    } else {
+      ctx.fillStyle = '#c9b48e';
+      ctx.font = '800 17px Nunito, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(T('slot_empty'), x + w / 2, y + h / 2 + 6);
+    }
+    y += h + gap;
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.font = '700 14px Nunito, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(T('slots_help'), view.w / 2, y + 16);
+}
+function renderIntro() {
+  renderBeachScene();
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  const item = intro.script[intro.idx];
+  const isLine = item !== undefined && item !== '@INPUT';
+  const talking = isLine && intro.shown < item.length;
+  drawNook(ctx, view.w / 2, view.h * 0.40, 3.1, talking);
+  if (intro.waitingInput) {
+    ctx.textAlign = 'center';
+    ctx.font = '900 24px Nunito, sans-serif';
+    ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(80,50,20,0.55)';
+    ctx.strokeText(T('ask_name'), view.w / 2, view.h * 0.68);
+    ctx.fillStyle = '#fff6dd';
+    ctx.fillText(T('ask_name'), view.w / 2, view.h * 0.68);
+    return;
+  }
+  if (isLine) {
+    const w = Math.min(640, view.w - 50), h = 124;
+    const x = (view.w - w) / 2, y = view.h - h - 30;
+    panel(x, y, w, h, 0.96);
+    ctx.fillStyle = '#3f7a4c';
+    roundRect(ctx, x + 20, y - 16, 120, 32, 999); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '900 15px Nunito, sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('Tom Nook', x + 36, y + 5);
+    const text = item.split('{name}').join(player.name).slice(0, Math.floor(intro.shown));
+    ctx.fillStyle = '#6b4a2a'; ctx.font = '800 16px Nunito, sans-serif';
+    wrapText(text, x + 28, y + 38, w - 56, 23);
+    if (intro.shown >= item.length) {
+      ctx.fillStyle = '#3f7a4c';
+      const bob = Math.sin(gameTime() * 5) * 2;
+      ctx.beginPath();
+      ctx.moveTo(x + w - 30, y + h - 20 + bob); ctx.lineTo(x + w - 18, y + h - 20 + bob); ctx.lineTo(x + w - 24, y + h - 12 + bob);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+}
+
+// ---------------- main loop ----------------
+function frame(now) {
+  const dt = clamp((now - lastT) / 1000, 0, 0.05);
+  lastT = now;
+  update(dt);
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  if (state === 'title') {
+    renderTitle();
+    renderParticles();
+    renderLightAndVignette();
+  } else if (state === 'slots') {
+    renderSlots();
+    renderParticles();
+    renderLightAndVignette();
+  } else if (state === 'intro') {
+    renderIntro();
+    renderParticles();
+    if (vignetteCv) { ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0); ctx.drawImage(vignetteCv, 0, 0, view.w, view.h); }
+  } else {
+    renderWorld();
+    renderParticles();
+    renderLightAndVignette();
+    renderHUD();
+  }
+
+  if (fade > 0) {
+    ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+    ctx.fillStyle = `rgba(12,10,24,${fade})`;
+    ctx.fillRect(0, 0, view.w, view.h);
+  }
+  requestAnimationFrame(frame);
+}
+
+// ---------------- boot ----------------
+resize();
+refreshProj();
+genWorld(20260612); // placeholder island behind title (real one loads with the slot)
+prog = freshProg(20260612);
+refreshRects();
+spawnNpcs();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
